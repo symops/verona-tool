@@ -46,7 +46,10 @@ func execute(p *plan) int {
 		fmt.Printf("auto-detected platform: %s\n", platform)
 	}
 
-	needWrite := p.doRestore != "" || len(p.writes) > 0
+	// --dry-run never actually opens the device for writing or takes an
+	// exclusive lock, regardless of what operations are planned -- it only
+	// reads and reports what WOULD happen.
+	needWrite := !p.dryRun && (p.doRestore != "" || len(p.writes) > 0)
 	exclusive := needWrite
 
 	dev, err := verona.Open(disk, platform, needWrite)
@@ -96,9 +99,15 @@ func execute(p *plan) int {
 		}
 		fileSizes[w.slot] = fi.Size()
 	}
+	overflowed := false
 	for _, w := range p.writes {
 		b, err := dev.Boundary(w.slot)
 		if err != nil {
+			if p.dryRun {
+				fmt.Fprintln(os.Stderr, "would fail:", err)
+				overflowed = true
+				continue
+			}
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return exitSlotRange
 		}
@@ -107,12 +116,21 @@ func execute(p *plan) int {
 			if w.group >= 0 {
 				msg += fmt.Sprintf(" (part of an atomic pair; neither slot %d nor its sibling will be written)", w.slot)
 			}
+			if p.dryRun {
+				fmt.Fprintln(os.Stderr, "would fail:", msg, "(exit code would be", exitTooLarge, ")")
+				overflowed = true
+				continue
+			}
 			fmt.Fprintln(os.Stderr, "error:", msg)
 			return exitTooLarge
 		}
 	}
 
 	if p.dryRun {
+		if overflowed {
+			fmt.Println("dry-run: at least one write above would be refused; the real run would exit non-zero and write nothing")
+			return exitOK
+		}
 		for _, w := range p.writes {
 			fmt.Printf("would write %d bytes to slot %d (%s) from %s\n", fileSizes[w.slot], w.slot, dev.Table.Fws[w.slot].FwType(), w.file)
 		}

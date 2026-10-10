@@ -47,10 +47,20 @@ func run(argv []string) int {
 	// grammar/conflicts, and run.
 	plan, err := buildPlan(a)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
 		if pe, ok := err.(*planError); ok {
+			if a.dryRun && pe.code == exitConflict {
+				// A conflict is a property of the arguments themselves,
+				// not of the device's state -- but per spec, --dry-run
+				// still only ever reports it as text and exits 0, the
+				// same as an overflow refusal it would otherwise detect
+				// once real execution started.
+				fmt.Fprintln(os.Stderr, "would fail:", err, "(exit code would be", pe.code, ")")
+				return exitOK
+			}
+			fmt.Fprintln(os.Stderr, "error:", err)
 			return pe.code
 		}
+		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitArgs
 	}
 

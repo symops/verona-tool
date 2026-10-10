@@ -14,10 +14,22 @@ Usage:
 Platform (-p, --platform)  [required]
   m, monarch, mch, home      WD My Cloud Home (single-bay, Realtek RTD1295)
   p, pelican, mchd, duo      WD My Cloud Home Duo (dual-bay, Realtek RTD1296)
+  a, auto                    auto-detect from -d's content (see below)
 
 Device (-d, --disk)
   Target block device or raw image file holding the VERONA table.
-  Required for mch. Optional for mchd (default: /dev/mmcblk0).
+  Required for mch. Optional for mchd (default: /dev/mmcblk0). Always
+  required when -p is auto -- there is no default to fall back to
+  before the platform is known.
+
+Auto-detection (-p auto)
+  Independently checks both candidate layouts on -d: a valid GPT (by
+  signature, revision, and header CRC32) with a partition named
+  FW_TABLE holding a valid VERONA table (Monarch), and a valid VERONA
+  table at the fixed Duo offset (6,422,528 bytes), ignoring GPT
+  entirely. Proceeds only if exactly one of the two validates fully;
+  refuses with a clear error (exit 1) if both validate (ambiguous) or
+  neither does.
 
 Read (-r, --read SLOT[:FILE])
   Dump the current contents of table entry SLOT to FILE.

@@ -9,6 +9,10 @@ separate, platform-specific vendor tools (`fwtablectl` for Monarch,
 See `SPEC.md` for the full, line-by-line specification this
 implementation follows. Run `verona-tool -h` for the CLI reference.
 
+`-p auto` (alias `-p a`) auto-detects the platform from `-d`'s content
+instead of requiring Monarch/Duo to be specified explicitly -- see
+SPEC.md's "Auto-detection" section for exactly how.
+
 ## Build
 
 The target runtime -- the rescue/recovery environment on both Monarch

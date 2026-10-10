@@ -686,12 +686,56 @@ def scenario_shortcut_write(platform):
     cleanup(img, src)
 
 
+def scenario_auto_detect(platform):
+    """-p auto must detect the right platform from -d's content alone."""
+    img = fresh(platform)
+    rc, out, err = verona(["-p", "auto", "-d", img, "-l"])
+    text = out.decode("utf-8", "replace")
+    want = "monarch" if platform == "mch" else "duo"
+    if rc == 0 and f"auto-detected platform: {want}" in text:
+        record("pass", f"auto_detect platform={platform}")
+    else:
+        record("genuine_failure", f"auto_detect platform={platform} rc={rc} out={text[:200]!r} err={err!r}")
+    cleanup(img)
+
+
+# Device-letter independence (Monarch only -- Duo has no device-letter
+# concept, it's always a flat eMMC path): confirm the GPT/FW_TABLE lookup
+# works through several different symlinked device-letter paths pointing at
+# the SAME synthetic disk content, catching any accidental "sda"-style
+# hardcoding regression.
+_DEVICE_LETTERS = ["/dev/sdb", "/dev/sdc", "/dev/sdx"]
+
+
+def scenario_device_letter_independence():
+    img = fresh("mch")
+    letter = random.choice(_DEVICE_LETTERS)
+    try:
+        os.remove(letter)
+    except OSError:
+        pass
+    os.symlink(img, letter)
+    try:
+        rc, out, err = verona(["-p", "mch", "-d", letter, "-l"])
+        text = out.decode("utf-8", "replace")
+        if rc == 0 and "Signature: VERONA__" in text and "Firmware entries (13):" in text:
+            record("pass", f"device_letter_independence letter={letter}")
+        else:
+            record("genuine_failure", f"device_letter_independence letter={letter} rc={rc} out={text[:200]!r} err={err!r}")
+    finally:
+        try:
+            os.remove(letter)
+        except OSError:
+            pass
+    cleanup(img)
+
+
 SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
                  scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
-                 scenario_shortcut_write]
+                 scenario_shortcut_write, scenario_auto_detect]
 SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
                  scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
-                 scenario_shortcut_write]
+                 scenario_shortcut_write, scenario_auto_detect]
 
 
 def main():
@@ -702,6 +746,17 @@ def main():
     i = 0
     while time.time() < deadline:
         i += 1
+        if random.random() < 0.05:
+            # No-platform-arg scenario: device-letter independence for
+            # Monarch (sdb/sdc/sdx), run on its own schedule.
+            try:
+                scenario_device_letter_independence()
+            except Exception as e:
+                record("genuine_failure", f"EXCEPTION in scenario_device_letter_independence: {e!r}")
+                log(f"EXCEPTION: {e!r}")
+            if i % 10 == 0:
+                log(f"iteration {i}: {json.dumps(counters)}")
+            continue
         platform = random.choice(["duo", "mch"])
         scenario = random.choice(SCENARIOS_DUO if platform == "duo" else SCENARIOS_MCH)
         try:

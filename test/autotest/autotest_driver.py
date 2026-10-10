@@ -447,7 +447,8 @@ import re
 _HDR_RE = re.compile(r"Signature:\s*(\S+)\s+Checksum:\s*0x([0-9a-fA-F]+)\s+Version:\s*(\d+)\s+Size:\s*(\d+)")
 _FW_RE = re.compile(
     r"^\s*(\d+):\s*(\S+)\s+ro=(\w+)\s+lzma=(\w+)\s+ver=(\d+)\s+target=0x([0-9a-fA-F]+)\s+"
-    r"offset=0x([0-9a-fA-F]+)\s+length=(\d+)\s+paddings=(\d+)\s+checksum=0x([0-9a-fA-F]+)"
+    r"offset=0x([0-9a-fA-F]+)\s+length=(\d+)\s+paddings=(\d+)\s+checksum=0x([0-9a-fA-F]+)",
+    re.MULTILINE,
 )
 
 

@@ -169,7 +169,18 @@ func (d *Device) Boundary(slot int) (uint64, error) {
 		if off%sectorSize != 0 {
 			return 0, fmt.Errorf("slot %d offset %d is not sector-aligned", slot, off)
 		}
-		return NextBoundaryBytes(d.gptParts, d.gptTotalSect, startLBA)
+		nextStart, err := NextBoundaryBytes(d.gptParts, d.gptTotalSect, startLBA)
+		if err != nil {
+			return 0, err
+		}
+		// NextBoundaryBytes returns the ABSOLUTE byte offset of the next
+		// boundary (next partition's start, or the GPT backup reserve);
+		// the available size for this slot is the distance from its own
+		// offset to that point.
+		if nextStart <= off {
+			return 0, fmt.Errorf("slot %d: computed next boundary %d is not after its own offset %d", slot, nextStart, off)
+		}
+		return nextStart - off, nil
 	}
 
 	// Duo: gap to next fw entry by offset.
@@ -204,7 +215,14 @@ func (d *Device) Boundary(slot int) (uint64, error) {
 func (d *Device) TableRegionBoundary() (uint64, error) {
 	if d.Platform == PlatformMonarch {
 		tableStartLBA := uint64(d.TableOffset) / sectorSize
-		return NextBoundaryBytes(d.gptParts, d.gptTotalSect, tableStartLBA)
+		nextStart, err := NextBoundaryBytes(d.gptParts, d.gptTotalSect, tableStartLBA)
+		if err != nil {
+			return 0, err
+		}
+		if nextStart <= uint64(d.TableOffset) {
+			return 0, fmt.Errorf("computed next boundary %d is not after the table's own offset %d", nextStart, d.TableOffset)
+		}
+		return nextStart - uint64(d.TableOffset), nil
 	}
 	// Duo: distance from the fixed table offset to the smallest fw-entry
 	// offset (the table and firmware blobs share the same raw address

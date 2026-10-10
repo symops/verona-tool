@@ -6,7 +6,7 @@ CROSS_CC := aarch64-linux-gnu-gcc
 # environment on both Monarch and Duo units) actually ships.
 ALLOWED_LIBS := ld-linux-aarch64.so.1 libblkid.so.1 libc.so.6 libcap.so.2 libfdisk.so.1 libm.so.6 libmount.so.1 libreadline.so.8 libresolv.so.2 libsmartcols.so.1 libtinfow.so.6 libudev.so.1 libuuid.so.1
 
-.PHONY: build build-arm64 verify-deps test clean
+.PHONY: build build-arm64 verify-deps strip test clean
 
 # Default build target: a normal dynamically-linked glibc binary for
 # arm64, cross-compiled with the aarch64 C toolchain. In practice this
@@ -35,6 +35,10 @@ verify-deps: build-arm64
 		if [ "$$found" = "0" ]; then echo "FAIL: $(BINARY)-arm64 needs $$lib, not in the target's library set"; exit 1; fi; \
 	done; \
 	echo "OK: $(BINARY)-arm64 needs only: $$needed"
+
+strip: verify-deps
+	aarch64-linux-gnu-strip $(BINARY)-arm64
+	@ls -la $(BINARY)-arm64
 
 test:
 	go test ./...

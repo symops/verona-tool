@@ -48,6 +48,9 @@ func run(argv []string) int {
 	plan, err := buildPlan(a)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		if pe, ok := err.(*planError); ok {
+			return pe.code
+		}
 		return exitArgs
 	}
 

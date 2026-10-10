@@ -4,6 +4,7 @@ Not part of the verona-tool binary or repo -- a standalone test harness."""
 import json
 import os
 import random
+import shlex
 import struct
 import subprocess
 import sys
@@ -19,6 +20,10 @@ GOLDEN_MCH = "/root/work/golden/monarch-golden.img"
 SCRATCH = "/root/work/scratch"
 LOGFILE = "/root/work/autotest.log"
 RESULTS = "/root/work/results.jsonl"
+# Local-only transcript of every tool invocation run during the test, in
+# order. Never committed to the repo -- this is purely a local debugging
+# aid, not test output.
+CMDLOG = "/root/work/commands.log"
 DUO_TABLE_OFFSET = 6422528
 
 FW_TYPES = ["Reserved","Bootcode","Kernel","RescueDeviceTree","KernelDeviceTree",
@@ -55,20 +60,28 @@ def record(kind, detail):
         counters["expected_divergence"][kind] = counters["expected_divergence"].get(kind, 0) + 1
 
 
+def log_cmd(binary_name, args):
+    with open(CMDLOG, "a") as f:
+        f.write(binary_name + " " + shlex.join(args) + "\n")
+
+
 def run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=False, timeout=60)
     return p.returncode, p.stdout, p.stderr
 
 
 def verona(args):
+    log_cmd("verona-tool", args)
     return run(QEMU + [VERONA] + args)
 
 
 def fwtutil(args):
+    log_cmd("fwtutil", args)
     return run(QEMU + [FWTUTIL] + args)
 
 
 def fwtablectl(args):
+    log_cmd("fwtablectl", args)
     return run(QEMU + [FWTABLECTL] + args)
 
 
@@ -429,8 +442,215 @@ def scenario_backup_restore_list(platform):
         pass
 
 
-SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal, scenario_backup_restore_list]
-SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal, scenario_backup_restore_list]
+import re
+
+_HDR_RE = re.compile(r"Signature:\s*(\S+)\s+Checksum:\s*0x([0-9a-fA-F]+)\s+Version:\s*(\d+)\s+Size:\s*(\d+)")
+_FW_RE = re.compile(
+    r"^\s*(\d+):\s*(\S+)\s+ro=(\w+)\s+lzma=(\w+)\s+ver=(\d+)\s+target=0x([0-9a-fA-F]+)\s+"
+    r"offset=0x([0-9a-fA-F]+)\s+length=(\d+)\s+paddings=(\d+)\s+checksum=0x([0-9a-fA-F]+)"
+)
+
+
+def scenario_list_check(platform):
+    """Dedicated, standalone -l check: run verona-tool -l and validate the
+    printed header + every firmware entry against the ground truth read
+    directly from the image bytes, not just "did it exit 0"."""
+    img = fresh(platform)
+    if platform == "duo":
+        off = DUO_TABLE_OFFSET
+    else:
+        off, _, _ = monarch_table_offset(img)
+    h = read_header(img, off)
+    fws = read_fw_entries(img, off, h["plen"], h["flen"])
+
+    rc, out, err = verona(["-p", platform, "-d", img, "-l"])
+    if rc != 0:
+        record("genuine_failure", f"list_check platform={platform} rc={rc} err={err!r}")
+        cleanup(img)
+        return
+    text = out.decode("utf-8", "replace")
+
+    hm = _HDR_RE.search(text)
+    if not hm:
+        record("genuine_failure", f"list_check platform={platform}: could not find header line in -l output")
+        cleanup(img)
+        return
+    if hm.group(1) != "VERONA__" or int(hm.group(2), 16) != h["cks"] or int(hm.group(3)) != h["ver"] or int(hm.group(4)) != h["paddings"]:
+        record("genuine_failure", f"list_check platform={platform}: header mismatch, -l printed {hm.groups()}, expected sig/cks/ver/paddings={h['cks']:#x}/{h['ver']}/{h['paddings']}")
+        cleanup(img)
+        return
+
+    seen = {}
+    for m in _FW_RE.finditer(text):
+        idx = int(m.group(1))
+        seen[idx] = dict(
+            type_name=m.group(2),
+            ro=m.group(3),
+            lzma=m.group(4),
+            ver=int(m.group(5)),
+            target=int(m.group(6), 16),
+            offset=int(m.group(7), 16),
+            length=int(m.group(8)),
+            paddings=int(m.group(9)),
+            checksum=int(m.group(10), 16),
+        )
+
+    mismatches = []
+    for e in fws:
+        s = seen.get(e["idx"])
+        if s is None:
+            mismatches.append(f"entry {e['idx']} missing from -l output")
+            continue
+        want_type = FW_TYPES[e["type"]] if e["type"] < len(FW_TYPES) else f"Invalid({e['type']})"
+        if (s["type_name"] != want_type or s["offset"] != e["offset"] or
+                s["length"] != e["length"] or s["paddings"] != e["paddings"] or
+                s["checksum"] != e["checksum"]):
+            mismatches.append(f"entry {e['idx']}: -l printed {s}, expected type={want_type} offset={e['offset']} length={e['length']} paddings={e['paddings']} checksum={e['checksum']}")
+    if len(seen) != len(fws):
+        mismatches.append(f"entry count mismatch: -l printed {len(seen)}, table has {len(fws)}")
+
+    if mismatches:
+        record("genuine_failure", f"list_check platform={platform}: {mismatches[:5]}")
+    else:
+        record("pass", f"list_check platform={platform} entries_verified={len(fws)}")
+    cleanup(img)
+
+
+SHORTCUT_SLOTS = {
+    "kernel": (5, 12),
+    "dtb": (7, 6),
+    "rootfs": (9, 8),
+}
+
+
+def scenario_shortcut_read(platform):
+    """Exercise -r --kernel / --dtb / --rootfs (and their -k/-t/-o short
+    forms): verify both files in the pair are produced and match a direct
+    read of each slot."""
+    img = fresh(platform)
+    name = random.choice(list(SHORTCUT_SLOTS))
+    flag = random.choice([f"--{name}", {"kernel": "-k", "dtb": "-t", "rootfs": "-o"}[name]])
+    slots = SHORTCUT_SLOTS[name]
+
+    rc, out, err = verona(["-p", platform, "-d", img, "-r", flag])
+    if rc != 0:
+        record("genuine_failure", f"shortcut_read platform={platform} name={name} rc={rc} err={err!r}")
+        cleanup(img)
+        return
+
+    ok = True
+    for slot in slots:
+        want_file = os.path.join(SCRATCH, f"{slot}.img")
+        if not os.path.exists(want_file):
+            record("genuine_failure", f"shortcut_read platform={platform} name={name}: {want_file} not produced")
+            ok = False
+            continue
+        off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
+        h = read_header(img, off)
+        fw = read_fw_entries(img, off, h["plen"], h["flen"])[slot]
+        with open(img, "rb") as f:
+            f.seek(fw["offset"])
+            want = f.read(fw["length"])
+        with open(want_file, "rb") as f:
+            got = f.read()
+        if got != want:
+            record("genuine_failure", f"shortcut_read platform={platform} name={name} slot={slot}: content mismatch")
+            ok = False
+        cleanup(want_file)
+    if ok:
+        record("pass", f"shortcut_read platform={platform} name={name} flag={flag}")
+    cleanup(img)
+
+
+def scenario_shortcut_write(platform):
+    """Exercise -w --kernel=file / --dtb=file / --rootfs=file (and -k/-t/-o):
+    normal case (both slots written identically), the atomic-pair boundary
+    check (deliberately oversize one slot's own boundary, confirm NEITHER
+    slot gets written), and the duplicate-shortcut conflict check."""
+    img = fresh(platform)
+    name = random.choice(list(SHORTCUT_SLOTS))
+    flag_long = f"--{name}"
+    flag_short = {"kernel": "-k", "dtb": "-t", "rootfs": "-o"}[name]
+    slots = SHORTCUT_SLOTS[name]
+
+    mode = random.choice(["normal", "oversized_half", "duplicate_conflict"])
+
+    if mode == "duplicate_conflict":
+        src = os.path.join(SCRATCH, f"dupe-{random.randint(0,1<<30)}.bin")
+        gen_random_file(src, 64)
+        before = sha256(img)
+        # Write-mode shortcuts only accept the '=FILE' attachment on the
+        # long option form (per SPEC.md); the short forms (-k/-t/-o) carry
+        # no value in write mode. Using the long form twice is still a
+        # valid way to exercise the duplicate-shortcut conflict check.
+        rc, out, err = verona(["-p", platform, "-d", img, "-w",
+                                f"{flag_long}={src}", "-w", f"{flag_long}={src}"])
+        after = sha256(img)
+        if rc == 5 and before == after:
+            record("pass", f"shortcut_write duplicate_conflict platform={platform} name={name}")
+        else:
+            record("genuine_failure", f"shortcut_write duplicate_conflict platform={platform} name={name} rc={rc} hash_unchanged={before==after}")
+        cleanup(img, src)
+        return
+
+    b0 = duo_boundary(img, slots[0]) if platform == "duo" else monarch_boundary(img, slots[0])
+    b1 = duo_boundary(img, slots[1]) if platform == "duo" else monarch_boundary(img, slots[1])
+    min_b = min(b0, b1)
+    if min_b < 16:
+        cleanup(img)
+        return
+
+    if mode == "oversized_half":
+        size = min_b + random.randint(1, 1 << 16)
+    else:
+        size = random.randint(1, min(min_b, 1 << 16))
+    src = os.path.join(SCRATCH, f"sw-{random.randint(0,1<<30)}.bin")
+    gen_random_file(src, size)
+    before = sha256(img)
+
+    # Write-mode shortcuts only accept '=FILE' on the long option form.
+    flag = flag_long
+    rc, out, err = verona(["-p", platform, "-d", img, "-w", f"{flag}={src}"])
+    after = sha256(img)
+
+    if mode == "oversized_half":
+        if rc == 3 and before == after:
+            record("pass", f"shortcut_write oversized_half platform={platform} name={name} size={size} min_boundary={min_b}")
+        else:
+            record("genuine_failure", f"shortcut_write oversized_half platform={platform} name={name} size={size} min_boundary={min_b} rc={rc} hash_unchanged={before==after}")
+        cleanup(img, src)
+        return
+
+    # normal case
+    if rc != 0:
+        record("genuine_failure", f"shortcut_write normal platform={platform} name={name} size={size} rc={rc} err={err!r}")
+        cleanup(img, src)
+        return
+    off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
+    h = read_header(img, off)
+    fws = read_fw_entries(img, off, h["plen"], h["flen"])
+    ok = True
+    with open(src, "rb") as f:
+        want = f.read()
+    for slot in slots:
+        fw = fws[slot]
+        with open(img, "rb") as f:
+            f.seek(fw["offset"])
+            got = f.read(fw["length"])
+        if got != want or fw["length"] != size:
+            record("genuine_failure", f"shortcut_write normal platform={platform} name={name} slot={slot}: written content/length mismatch")
+            ok = False
+    if ok:
+        record("pass", f"shortcut_write normal platform={platform} name={name} flag={flag} size={size}")
+    cleanup(img, src)
+
+
+SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
+                 scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
+                 scenario_shortcut_write]
+SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
+                 scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
+                 scenario_shortcut_write]
 
 
 def main():

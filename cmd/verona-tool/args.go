@@ -190,10 +190,11 @@ func parseArgs(argv []string) (*args, error) {
 			var got bool
 			if hasAttached {
 				tokv, got = attached, true
-			} else if name != "write" {
-				if i+1 >= len(argv) {
-					return nil, fmt.Errorf("missing SLOT:FILE after -w")
-				}
+			} else if name != "write" && i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
+				// Bare "-w" immediately followed by a flag (e.g. a
+				// shortcut's "--kernel=file") just selects write mode,
+				// the same as bare "--write" -- it must NOT swallow that
+				// flag as its own malformed SLOT:FILE value.
 				i++
 				tokv, got = argv[i], true
 			}

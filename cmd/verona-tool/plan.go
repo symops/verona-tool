@@ -6,6 +6,21 @@ import (
 	"time"
 )
 
+// planError carries the specific exit code a plan-building error maps to.
+// Most mistakes caught in buildPlan are plain usage errors (exitArgs), but
+// a slot conflict must report exitConflict per SPEC.md's table, not fall
+// back to the generic exitArgs like everything else here.
+type planError struct {
+	code int
+	err  error
+}
+
+func (e *planError) Error() string { return e.err.Error() }
+
+func conflictErrorf(format string, args ...interface{}) error {
+	return &planError{code: exitConflict, err: fmt.Errorf(format, args...)}
+}
+
 type writeOp struct {
 	slot int
 	file string
@@ -133,7 +148,7 @@ func buildPlan(a *args) (*plan, error) {
 	seen := map[int]bool{}
 	for _, w := range p.writes {
 		if seen[w.slot] {
-			return nil, fmt.Errorf("conflict: slot %d is targeted by more than one write (explicit -w and/or a shortcut)", w.slot)
+			return nil, conflictErrorf("conflict: slot %d is targeted by more than one write (explicit -w and/or a shortcut)", w.slot)
 		}
 		seen[w.slot] = true
 	}

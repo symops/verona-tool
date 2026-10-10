@@ -212,6 +212,34 @@ def fwcount(img, platform):
     return h["flen"] // 32
 
 
+def read_slot_payload(img, platform, slot):
+    """Independently read a slot's raw payload bytes directly off the image
+    at its real byte offset, entirely bypassing verona-tool (equivalent to
+    dd if=img bs=1 skip=OFFSET count=LENGTH) -- confirms a write actually
+    landed at the correct physical location, not just that the table's
+    bookkeeping fields say so."""
+    off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
+    h = read_header(img, off)
+    fw = read_fw_entries(img, off, h["plen"], h["flen"])[slot]
+    with open(img, "rb") as f:
+        f.seek(fw["offset"])
+        return f.read(fw["length"]), fw["offset"], fw["length"]
+
+
+def verify_payload(img, platform, slot, src_path, context):
+    """Independent-read check: compare the slot's on-disk payload (read
+    directly, bypassing verona-tool) against the source file that was
+    supposedly written there. Returns True on match; records a
+    genuine_failure and returns False on mismatch."""
+    got, off, length = read_slot_payload(img, platform, slot)
+    with open(src_path, "rb") as f:
+        want = f.read()
+    if got != want:
+        record("genuine_failure", f"{context}: independent read-back at offset={off} length={length} does not match source file {src_path} (bypassing verona-tool)")
+        return False
+    return True
+
+
 # ---------------------------------------------------------------- scenarios
 
 def scenario_single_write(platform):
@@ -238,6 +266,13 @@ def scenario_single_write(platform):
     rc, out, err = verona(["-p", platform, "-d", img_a, "-w", f"{slot}:{src}"])
     if rc != 0:
         record("genuine_failure", f"single_write platform={platform} slot={slot} size={size} verona rc={rc} err={err!r}")
+        cleanup(img_a, img_b, src)
+        return
+
+    # Independent read-back, bypassing verona-tool entirely: confirm the
+    # payload actually landed at the slot's real byte offset on the image,
+    # not just that the table's Length/Checksum bookkeeping say so.
+    if not verify_payload(img_a, platform, slot, src, f"single_write platform={platform} slot={slot} size={size}"):
         cleanup(img_a, img_b, src)
         return
 
@@ -352,7 +387,12 @@ def scenario_sequential_overwrites(platform):
             record("genuine_failure", f"sequential_overwrite platform={platform} slot={slot} round={r} rc={rc} err={err!r}")
             ok = False
             break
-        # verify readback after EACH round, not just the last.
+        # Independent read-back after EACH round, bypassing verona-tool,
+        # confirming the payload is physically at the slot's real offset.
+        if not verify_payload(img_a, platform, slot, src, f"sequential_overwrite platform={platform} slot={slot} round={r}"):
+            ok = False
+            break
+        # Also verify via verona-tool's own -r, after EACH round.
         rc2, out2, err2 = verona(["-p", platform, "-d", img_a, "-r", f"{slot}:{src}.readback"])
         if rc2 != 0:
             record("genuine_failure", f"sequential_overwrite readback platform={platform} slot={slot} round={r} rc={rc2}")

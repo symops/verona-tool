@@ -864,6 +864,25 @@ def open_table_bytes(img, off, length):
         return f.read(length)
 
 
+def table_region_boundary(img, platform):
+    """Mirror of Device.TableRegionBoundary() in Go: how large a
+    replacement table may be without overflowing into real data. Needed
+    because the table's own region size differs a lot between platforms
+    (Monarch's FW_TABLE GPT partition is ~1MB; Duo's is bounded by its
+    nearest firmware entry's offset, often much smaller) -- a fixed
+    multiplier that's oversized on one platform is not guaranteed to be
+    oversized on the other."""
+    if platform == "duo":
+        off = DUO_TABLE_OFFSET
+        h = read_header(img, off)
+        fws = read_fw_entries(img, off, h["plen"], h["flen"])
+        min_off = min(f["offset"] for f in fws)
+        return min_off - off
+    off, parts, _ = monarch_table_offset(img)
+    idx = parts.index(off // 512)
+    return parts[idx + 1] * 512 - off
+
+
 def edge_restore_oversized_paddings(platform):
     img = fresh(platform)
     off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
@@ -874,10 +893,15 @@ def edge_restore_oversized_paddings(platform):
         good = f.read(h["paddings"])
     with open(backup, "wb") as f:
         f.write(good)
-    # Patch the backup's own Paddings field to something absurdly large,
-    # with a correctly-recomputed checksum, so it passes signature/
-    # checksum validation but fails the size-vs-available-space check.
-    write_table_header(backup, 0, paddings=h["paddings"] * 1000)
+    # Patch the backup's own Paddings field to something guaranteed to
+    # exceed the REAL available table-region space on this platform (not
+    # a fixed multiplier -- Monarch's FW_TABLE partition is ~1MB, far
+    # bigger than a fixed small multiple of the original ~1KB table size
+    # would be "oversized" relative to), with a correctly-recomputed
+    # checksum so it passes signature/checksum validation and only fails
+    # the size-vs-available-space check.
+    boundary = table_region_boundary(img, platform)
+    write_table_header(backup, 0, paddings=boundary + 4096)
     before = open_table_bytes(img, off, h["paddings"])
     rc, out, err = verona(["-p", platform, "-d", img, "-e", backup])
     after = open_table_bytes(img, off, h["paddings"])

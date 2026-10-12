@@ -31,15 +31,14 @@ DUO_TABLE_OFFSET = 6422528
 # --- test-data diversity helpers -------------------------------------------
 
 PLATFORM_ALIASES = {
-    "mch": ["m", "monarch", "mch", "home", "auto"],
-    "duo": ["p", "pelican", "mchd", "duo", "auto"],
+    "mch": ["m", "monarch", "mch", "home"],
+    "duo": ["p", "pelican", "mchd", "duo"],
 }
 
 
 def platform_flag(platform):
-    """A randomly chosen valid -p/--platform alias for this platform,
-    including 'auto' as a regular pick (not just in the dedicated
-    auto_detect scenario) -- not always the canonical 'duo'/'mch' form."""
+    """A randomly chosen valid -p/--platform alias for this platform --
+    not always the canonical 'duo'/'mch' form."""
     return random.choice(PLATFORM_ALIASES[platform])
 
 
@@ -1001,19 +1000,6 @@ def scenario_shortcut_write(platform):
     cleanup(img, src)
 
 
-def scenario_auto_detect(platform):
-    """-p auto must detect the right platform from -d's content alone."""
-    img = fresh(platform)
-    rc, out, err = verona(["-p", "auto", "-d", img, "-l"])
-    text = out.decode("utf-8", "replace")
-    want = "monarch" if platform == "mch" else "duo"
-    if rc == 0 and f"auto-detected platform: {want}" in text:
-        record("pass", f"auto_detect platform={platform}")
-    else:
-        record("genuine_failure", f"auto_detect platform={platform} rc={rc} out={text[:200]!r} err={err!r}")
-    cleanup(img)
-
-
 # Device-letter independence (Monarch only -- Duo has no device-letter
 # concept, it's always a flat eMMC path): confirm the GPT/FW_TABLE lookup
 # works through several different symlinked device-letter paths pointing at
@@ -1568,12 +1554,12 @@ def edge_backup_twice_same_second(platform):
 
 SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
                  scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
-                 scenario_shortcut_write, scenario_auto_detect, scenario_multi_read,
+                 scenario_shortcut_write, scenario_multi_read,
                  scenario_duo_fwtutil_crosscheck, scenario_duo_fwtutil_crosscheck,
                  edge_out_of_range_slot]
 SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
                  scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
-                 scenario_shortcut_write, scenario_auto_detect, scenario_multi_read,
+                 scenario_shortcut_write, scenario_multi_read,
                  scenario_mch_fwtablectl_crosscheck, scenario_mch_fwtablectl_crosscheck,
                  edge_out_of_range_slot]
 
@@ -1805,10 +1791,7 @@ def edge_doc_platform_aliases():
     """Every platform alias documented in --help's text must actually be
     accepted by the real binary -- not just the canonical duo/mch forms,
     and not just whatever platform_flag() happens to roll elsewhere.
-    Guards doc/behavior drift. 'auto' is exercised thoroughly elsewhere
-    (scenario_auto_detect, platform_flag()'s regular inclusion of it) and
-    isn't a simple "accepted" check the same way, so it's not repeated
-    here."""
+    Guards doc/behavior drift."""
     ok = True
     for canonical, aliases in _PLATFORM_ALIASES_DOC.items():
         img = fresh(canonical)

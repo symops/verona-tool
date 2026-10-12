@@ -90,30 +90,10 @@ is no padding/zero-fill feature at all; a write places exactly
 ## CLI
 
 `-p`/`--platform` VALUE (required). Aliases: `m,monarch,mch,home` ->
-Monarch; `p,pelican,mchd,duo` -> Duo; `a,auto` -> auto-detect from
-`-d`'s content.
+Monarch; `p,pelican,mchd,duo` -> Duo.
 
 `-d`/`--device` PATH. Required for Monarch; optional for Duo (default
-`/dev/mmcblk0`); **always required when `-p` is `auto`** (no default
-can be applied before the platform is known). A plain file works too
-(needed for testing).
-
-### Auto-detection (`-p auto`)
-
-Independently validates both candidate layouts on `-d`:
-- **Monarch candidate**: a valid GPT header at LBA1 (signature
-  `EFI PART`, revision `0x00010000`, and a correct header CRC32 --
-  stricter than the plain signature check used once a platform is
-  already known), a partition named `FW_TABLE` in its partition
-  array, and a valid (signature + checksum) VERONA table at that
-  partition's `StartingLBA`.
-- **Duo candidate**: a valid (signature + checksum) VERONA table at
-  the fixed offset 6,422,528, ignoring GPT entirely.
-
-Both are always checked independently (neither short-circuits the
-other). Exactly one validating -> use that platform. Both validating
--> ambiguous, exit 1, telling the user to specify `-p` explicitly.
-Neither validating -> exit 1 with both candidates' failure reasons.
+`/dev/mmcblk0`). A plain file works too (needed for testing).
 
 `-r`/`--read` `SLOT[:FILE]` or `SLOT=FILE` (repeatable). FILE omitted
 -> `./SLOT.img`. Reading an empty (length 0) slot -> empty file, no

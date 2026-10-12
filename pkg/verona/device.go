@@ -12,21 +12,14 @@ type Platform int
 const (
 	PlatformMonarch Platform = iota // MCH
 	PlatformDuo                     // MCHD
-	// PlatformAuto is a pseudo-platform meaning "detect from -d's content"
-	// (ParsePlatform's "a"/"auto" alias). Callers must resolve it via
-	// DetectPlatform before using it anywhere a real Platform is expected
-	// (Device.Open rejects it).
-	PlatformAuto
 )
 
 func (p Platform) String() string {
 	switch p {
 	case PlatformMonarch:
 		return "monarch"
-	case PlatformDuo:
-		return "duo"
 	default:
-		return "auto"
+		return "duo"
 	}
 }
 
@@ -37,8 +30,6 @@ func ParsePlatform(s string) (Platform, error) {
 		return PlatformMonarch, nil
 	case "p", "pelican", "mchd", "duo":
 		return PlatformDuo, nil
-	case "a", "auto":
-		return PlatformAuto, nil
 	}
 	return 0, fmt.Errorf("unknown platform %q", s)
 }
@@ -70,9 +61,6 @@ type Device struct {
 // validates it (signature, alignment, checksum). readWrite selects O_RDONLY
 // vs O_RDWR.
 func Open(path string, platform Platform, readWrite bool) (*Device, error) {
-	if platform == PlatformAuto {
-		return nil, fmt.Errorf("internal error: PlatformAuto must be resolved via DetectPlatform before calling Open")
-	}
 	flag := os.O_RDONLY
 	if readWrite {
 		flag = os.O_RDWR

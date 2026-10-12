@@ -30,33 +30,12 @@ func execute(p *plan) int {
 	}
 
 	device := p.device
-	if platform == verona.PlatformAuto && device == "" {
-		fmt.Fprintln(os.Stderr, "error: -d/--device is required when -p/--platform is auto")
-		return exitArgs
-	}
 	if device == "" {
 		if platform == verona.PlatformMonarch {
 			fmt.Fprintln(os.Stderr, "error: -d/--device is required for the monarch/mch platform")
 			return exitArgs
 		}
 		device = "/dev/mmcblk0"
-	}
-
-	if platform == verona.PlatformAuto {
-		dbg(p.debug, "platform=auto: probing both Monarch (GPT+FW_TABLE) and Duo (fixed offset) candidates on %s", device)
-		f, ferr := os.Open(device)
-		if ferr != nil {
-			fmt.Fprintln(os.Stderr, "error:", ferr)
-			return exitTableInvalid
-		}
-		detected, derr := verona.DetectPlatform(f)
-		f.Close()
-		if derr != nil {
-			fmt.Fprintln(os.Stderr, "error:", derr)
-			return exitTableInvalid
-		}
-		platform = detected
-		fmt.Printf("auto-detected platform: %s\n", platform)
 	}
 
 	// --dry-run never actually opens the device for writing or takes an

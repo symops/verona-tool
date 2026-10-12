@@ -82,8 +82,6 @@ sudo ./verona-tool-arm64 -p duo -l                 # -d defaults to /dev/mmcblk0
 
 `-d` is interchangeable between a real block device and a plain file — `verona-tool` just opens whatever path it's given and never assumes a device node. This is what makes the autotest harness (step 8) able to test the exact same binary against disk images with no special-casing. As with the kernel-port repos' own flashing tools, **writing (`-w`) to a real device is irreversible and not interactively confirmed** — always prove a write against a copy of the real image first (`cp` the device to a file, test against the file), and double-check `-d`'s target before running anything with `-w`/`-R`/`-B` against real hardware.
 
-`-p auto` (alias `-p a`) can detect the platform from `-d`'s content instead of specifying `mch`/`duo` explicitly — see `SPEC.md`'s "Auto-detection" section for exactly how, and its two-way-ambiguity failure mode.
-
 ## 8. The autotest harness
 
 `test/autotest/autotest_driver.py` is a standalone Python harness, **not part of the Go build** (it's never imported by or compiled into `cmd/verona-tool`) and not something `make` runs. It drives the real cross-compiled `verona-tool-arm64` under `qemu-aarch64-static`, alongside the real vendor tools (`fwtablectl`, `fwtutil`) for cross-validation, against full-size golden disk images, inside an isolated container — see the comments at the top of the file for the exact directory layout (`/opt/tools/`, `/root/work/golden/`, etc.) it expects when run. It is a correctness/regression tool for this repo's own development, not something an end user deploying `verona-tool` needs to run.

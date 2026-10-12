@@ -951,7 +951,7 @@ def edge_dry_run_overflow(platform):
     src = test_path("ov", ".bin")
     gen_random_file(src, boundary + 1024)
     before = sha256(img)
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-y", "-w", f"{slot}{sep()}{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-n", "-w", f"{slot}{sep()}{src}"])
     after = sha256(img)
     text = err.decode("utf-8", "replace")
     if rc == 0 and before == after and "would fail" in text:
@@ -968,7 +968,7 @@ def edge_dry_run_conflict(platform):
     src = test_path("dc", ".bin")
     gen_random_file(src, 32)
     before = sha256(img)
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-y", "-w", f"{slot}{sep()}{src}", "-w", f"{slot}{sep()}{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-n", "-w", f"{slot}{sep()}{src}", "-w", f"{slot}{sep()}{src}"])
     after = sha256(img)
     text = err.decode("utf-8", "replace")
     if rc == 0 and before == after and "would fail" in text:
@@ -1140,7 +1140,7 @@ def edge_debug_flag(platform):
 
 
 def edge_dry_run_alone(platform):
-    rc, out, err = verona(["-p", platform_flag(platform), "-y"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-n"])
     if rc == 1:
         record("pass", f"edge_dry_run_alone platform={platform}")
     else:

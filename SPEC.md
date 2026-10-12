@@ -142,7 +142,7 @@ checksum, alignment, and that its `Paddings` does not exceed the real
 space available for the table region on the current `-d`, before
 writing it back wholesale. Fully exclusive, including vs. `-B`.
 
-`-y`/`--dry-run` -- compatible with everything. Performs every
+`-n`/`--dry-run` -- compatible with everything. Performs every
 read-side check and reports what would happen / what would fail,
 without writing anything. Exits 0 whenever the simulation itself ran
 to completion (even if it reports that the real run would fail).

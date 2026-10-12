@@ -77,7 +77,7 @@ List (-l, --list)
   Print the full table (header, partitions, firmware entries) and
   exit. Exclusive: not compatible with anything else.
 
--y, --dry-run    Print what would be read/written and which checks
+-n, --dry-run    Print what would be read/written and which checks
                  would pass or fail, without opening the device
                  for writing.
 -D, --debug      Print extra internal diagnostics (table location,

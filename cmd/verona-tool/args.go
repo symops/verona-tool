@@ -128,7 +128,7 @@ func parseArgs(argv []string) (*args, error) {
 			a.help = true
 		case "v", "version":
 			a.version = true
-		case "y", "dry-run":
+		case "n", "dry-run":
 			a.dryRun = true
 		case "D", "debug":
 			a.debug = true

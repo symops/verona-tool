@@ -321,6 +321,8 @@ def fresh(platform):
 
 def cleanup(*paths):
     for p in paths:
+        if p is None:
+            continue
         try:
             if os.path.islink(p):
                 target = os.path.realpath(p)

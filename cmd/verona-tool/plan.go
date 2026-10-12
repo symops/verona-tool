@@ -37,7 +37,7 @@ type readOp struct {
 
 type plan struct {
 	platform string
-	disk     string
+	device   string
 	dryRun   bool
 	debug    bool
 
@@ -58,7 +58,7 @@ type plan struct {
 }
 
 func buildPlan(a *args) (*plan, error) {
-	p := &plan{platform: a.platform, disk: a.disk, dryRun: a.dryRun, debug: a.debug}
+	p := &plan{platform: a.platform, device: a.device, dryRun: a.dryRun, debug: a.debug}
 
 	if a.platform == "" {
 		return nil, fmt.Errorf("-p/--platform is required")
@@ -73,10 +73,10 @@ func buildPlan(a *args) (*plan, error) {
 	}
 	hasOrdinary := len(a.reads) > 0 || len(a.writes) > 0 || a.backup || len(a.shortcutsSeen) > 0
 	if exclusiveCount > 0 && hasOrdinary {
-		return nil, fmt.Errorf("-l/--list and -e/--restore cannot be combined with -r/-w/-k/-t/-o/-b")
+		return nil, fmt.Errorf("-l/--list and -R/--restore cannot be combined with -r/-w/-k/-t/-f/-B")
 	}
 	if a.list && a.restore != "" {
-		return nil, fmt.Errorf("-l/--list and -e/--restore cannot be combined with each other")
+		return nil, fmt.Errorf("-l/--list and -R/--restore cannot be combined with each other")
 	}
 
 	if a.list {
@@ -91,7 +91,7 @@ func buildPlan(a *args) (*plan, error) {
 	// Ordinary mode: -b (optional) + -r/-w (incl. shortcuts), at least one
 	// of which must be present.
 	if !hasOrdinary {
-		return nil, fmt.Errorf("at least one of -r/-w/-b/-l/-e is required")
+		return nil, fmt.Errorf("at least one of -r/-w/-B/-l/-R is required")
 	}
 
 	if a.backup {

@@ -86,7 +86,7 @@ is no padding/zero-fill feature at all; a write places exactly
 Monarch; `p,pelican,mchd,duo` -> Duo; `a,auto` -> auto-detect from
 `-d`'s content.
 
-`-d`/`--disk` PATH. Required for Monarch; optional for Duo (default
+`-d`/`--device` PATH. Required for Monarch; optional for Duo (default
 `/dev/mmcblk0`); **always required when `-p` is `auto`** (no default
 can be applied before the platform is known). A plain file works too
 (needed for testing).
@@ -119,7 +119,7 @@ Updates only `Length`/`Paddings`/`Checksum`; never touches
 boundary above before writing anything. Table checksum is recomputed
 once, after every `-w` has been applied.
 
-`-k`/`--kernel`, `-t`/`--dtb`, `-o`/`--rootfs` -- shortcuts for slot
+`-k`/`--kernel`, `-t`/`--dtb`, `-f`/`--rootfs` -- shortcuts for slot
 pairs `{5,12}`, `{7,6}`, `{9,8}`. Must be combined with an explicit
 bare `-r` or `-w` to select mode (a shortcut with neither present is a
 usage error). Read mode: no value, auto-names both outputs by slot
@@ -129,18 +129,18 @@ supported, hence the custom parser), same file written identically
 into both slots, checked atomically against both boundaries before
 writing to either.
 
-`-b`/`--backup` `[FILE]` -- default
+`-B`/`--backup` `[FILE]` -- default
 `verona-table-backup-<platform>-<YYYYMMDDHHMMSS>.img`. Saves the
 whole table region (exactly `Paddings` bytes). Always runs first,
 unconditionally, even if later `-r`/`-w` in the same call end up
-failing. Compatible with `-r`/`-w`/`-k`/`-t`/`-o`; not with `-l`/`-e`.
+failing. Compatible with `-r`/`-w`/`-k`/`-t`/`-f`; not with `-l`/`-R`.
 
 `-l`/`--list` -- prints the full table, exits. Fully exclusive.
 
-`-e`/`--restore` `FILE` (required). Validates FILE's own signature,
+`-R`/`--restore` `FILE` (required). Validates FILE's own signature,
 checksum, alignment, and that its `Paddings` does not exceed the real
 space available for the table region on the current `-d`, before
-writing it back wholesale. Fully exclusive, including vs. `-b`.
+writing it back wholesale. Fully exclusive, including vs. `-B`.
 
 `-y`/`--dry-run` -- compatible with everything. Performs every
 read-side check and reports what would happen / what would fail,
@@ -148,7 +148,7 @@ without writing anything. Exits 0 whenever the simulation itself ran
 to completion (even if it reports that the real run would fail).
 Alone (no action flag) is a usage error.
 
-`-u`/`--debug` -- compatible with everything. Prints extra internal
+`-D`/`--debug` -- compatible with everything. Prints extra internal
 diagnostics (table location, computed boundaries, lock acquisition,
 byte offsets, checksums) alongside the normal output. Purely additive:
 has no effect on what is actually done or on the resulting file/table
@@ -159,21 +159,21 @@ alone. Version author: Symo <symops@gmail.com>.
 
 ### Ordering & validation
 
-- At least one of `-r`/`-w`/`-b`/`-l`/`-e` required, unless `-h`/`-v`
+- At least one of `-r`/`-w`/`-B`/`-l`/`-R` required, unless `-h`/`-v`
   present.
-- Order: `-b` -> all `-r` -> all `-w` (textual order on the command
+- Order: `-B` -> all `-r` -> all `-w` (textual order on the command
   line is irrelevant).
 - Conflict (exit 5): the same slot targeted by more than one `-w`
   after shortcut expansion; the same shortcut given twice in write
   mode; an explicit `-w N` whose N also belongs to an active
   write-mode shortcut group.
-- Output-path collisions across `-r`/`-b` targets -> warning, not an
+- Output-path collisions across `-r`/`-B` targets -> warning, not an
   error.
 - Locking: `flock` on `-d` for the whole invocation, non-blocking.
   Shared lock for read-only invocations, exclusive if any
   write/restore is present. Already locked -> immediate failure, exit
   7, no retry.
-- After every data write and every table write (including `-e`):
+- After every data write and every table write (including `-R`):
   re-read the exact range just written and compare to the source;
   mismatch -> exit 6, no retry.
 - `fsync` after every write, before close.

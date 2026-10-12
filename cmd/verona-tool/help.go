@@ -5,9 +5,9 @@ const helpText = `verona-tool - unified read/write tool for the VERONA firmware 
 
 Usage:
   verona-tool -p PLATFORM [-d DEVICE] [-r SLOT[:FILE]]... [-w SLOT:FILE]... [options]
-  verona-tool -p PLATFORM [-d DEVICE] -b [FILE] [-r ...] [-w ...]
+  verona-tool -p PLATFORM [-d DEVICE] -B [FILE] [-r ...] [-w ...]
   verona-tool -p PLATFORM [-d DEVICE] -l
-  verona-tool -p PLATFORM [-d DEVICE] -e FILE
+  verona-tool -p PLATFORM [-d DEVICE] -R FILE
   verona-tool -h | --help
   verona-tool -v | --version
 
@@ -16,7 +16,7 @@ Platform (-p, --platform)  [required]
   p, pelican, mchd, duo      WD My Cloud Home Duo (dual-bay, Realtek RTD1296)
   a, auto                    auto-detect from -d's content (see below)
 
-Device (-d, --disk)
+Device (-d, --device)
   Target block device or raw image file holding the VERONA table.
   Required for mch. Optional for mchd (default: /dev/mmcblk0). Always
   required when -p is auto -- there is no default to fall back to
@@ -52,7 +52,7 @@ Write (-w, --write SLOT:FILE)
 Shortcuts for common slot pairs (active + rescue copy)
   -k, --kernel            Kernel / RescueKernel
   -t, --dtb               KernelDeviceTree / RescueDeviceTree
-  -o, --rootfs            KernelRootFS / RescueRootFS
+  -f, --rootfs            KernelRootFS / RescueRootFS
   Must be combined with an explicit bare -r or -w in the same
   invocation to select read or write mode. In read mode they take
   no value (two files, named after their own slot numbers, are
@@ -61,17 +61,17 @@ Shortcuts for common slot pairs (active + rescue copy)
   fits within both their boundaries -- otherwise neither slot is
   touched).
 
-Backup (-b, --backup [FILE])
+Backup (-B, --backup [FILE])
   Save the whole table to FILE before doing anything else in this
   invocation. FILE may be omitted; it then defaults to
   verona-table-backup-<platform>-<timestamp>.img. Always runs
-  first, unconditionally. Compatible with -r/-w/-k/-t/-o; not
-  compatible with -l or -e.
+  first, unconditionally. Compatible with -r/-w/-k/-t/-f; not
+  compatible with -l or -R.
 
-Restore (-e, --restore FILE)
+Restore (-R, --restore FILE)
   Validate FILE (signature, checksum, size) and, if valid, write
   it back over the table. Exclusive: not compatible with anything
-  else, including -b.
+  else, including -B.
 
 List (-l, --list)
   Print the full table (header, partitions, firmware entries) and
@@ -80,7 +80,7 @@ List (-l, --list)
 -y, --dry-run    Print what would be read/written and which checks
                  would pass or fail, without opening the device
                  for writing.
--u, --debug      Print extra internal diagnostics (table location,
+-D, --debug      Print extra internal diagnostics (table location,
                  computed boundaries, lock state, byte offsets,
                  checksums) alongside the normal output. Has no
                  effect on what is actually done.

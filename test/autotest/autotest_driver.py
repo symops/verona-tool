@@ -384,7 +384,12 @@ def scenario_single_write(platform):
         except OSError:
             pass
         os.symlink(img_b, "/dev/mmcblk0")
-        rc2, out2, err2 = fwtutil(["-r", f"{slot}:{src}"])
+        # The real fwtutil's CLI is the opposite of what the flag letters
+        # suggest: "-x" extracts/reads a slot to FILE, "-r"/"-R" replaces
+        # (writes) a slot FROM FILE. Confirmed directly against the real
+        # binary's own output ("Извлечение раздела..." for -x vs.
+        # "Замена раздела..." for -r).
+        rc2, out2, err2 = fwtutil(["-x", f"{slot}:{src}"])
         if rc2 != 0:
             record("genuine_failure", f"single_write duo slot={slot} size={size} fwtutil rc={rc2} err={err2!r}")
             cleanup(img_a, img_b, src)
@@ -541,11 +546,11 @@ def scenario_backup_restore_list(platform):
     h = read_header(img_a, off)
     table_before = open(img_a, "rb").read()[off:off + h["paddings"]]
 
-    # -b (explicit filename) combined with a harmless -r SLOT (list/backup
+    # -B (explicit filename) combined with a harmless -r SLOT (list/backup
     # alone with no -r/-w would still be valid per spec, but exercising
-    # -b alongside an ordinary -r is also part of what we want covered).
+    # -B alongside an ordinary -r is also part of what we want covered).
     read_slot = random.randint(0, n - 1)
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-b", backup_file, "-r", str(read_slot)])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-B", backup_file, "-r", str(read_slot)])
     if rc != 0:
         record("genuine_failure", f"backup platform={platform} rc={rc} err={err!r}")
         cleanup(img_a, backup_file)
@@ -569,7 +574,7 @@ def scenario_backup_restore_list(platform):
             cleanup(img_a, backup_file)
             return
 
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-e", backup_file])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-R", backup_file])
     if rc != 0:
         record("genuine_failure", f"restore platform={platform} rc={rc} err={err!r}")
         cleanup(img_a, backup_file)
@@ -675,7 +680,7 @@ def scenario_shortcut_read(platform):
     read of each slot."""
     img = fresh(platform)
     name = random.choice(list(SHORTCUT_SLOTS))
-    flag = random.choice([f"--{name}", {"kernel": "-k", "dtb": "-t", "rootfs": "-o"}[name]])
+    flag = random.choice([f"--{name}", {"kernel": "-k", "dtb": "-t", "rootfs": "-f"}[name]])
     slots = SHORTCUT_SLOTS[name]
 
     rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", flag])
@@ -716,7 +721,7 @@ def scenario_shortcut_write(platform):
     img = fresh(platform)
     name = random.choice(list(SHORTCUT_SLOTS))
     flag_long = f"--{name}"
-    flag_short = {"kernel": "-k", "dtb": "-t", "rootfs": "-o"}[name]
+    flag_short = {"kernel": "-k", "dtb": "-t", "rootfs": "-f"}[name]
     slots = SHORTCUT_SLOTS[name]
 
     mode = random.choice(["normal", "oversized_half", "duplicate_conflict"])
@@ -957,7 +962,7 @@ def edge_restore_corrupted(platform):
     with open(backup, "wb") as f:
         f.write(good[: len(good) // 2])
     before = open_table_bytes(img, off, h["paddings"])
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-e", backup])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-R", backup])
     after = open_table_bytes(img, off, h["paddings"])
     if rc == 2 and before == after:
         record("pass", f"edge_restore_corrupted platform={platform}")
@@ -1011,7 +1016,7 @@ def edge_restore_oversized_paddings(platform):
     boundary = table_region_boundary(img, platform)
     write_table_header(backup, 0, paddings=boundary + 4096)
     before = open_table_bytes(img, off, h["paddings"])
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-e", backup])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-R", backup])
     after = open_table_bytes(img, off, h["paddings"])
     if rc == 2 and before == after:
         record("pass", f"edge_restore_oversized_paddings platform={platform}")
@@ -1070,7 +1075,7 @@ def edge_out_of_range_slot(platform):
 
 
 def edge_debug_flag(platform):
-    """-u/--debug must produce visibly more output than the same operation
+    """-D/--debug must produce visibly more output than the same operation
     without it, and must not change the resulting file/table state at all."""
     img_plain = fresh(platform)
     img_debug = fresh(platform)
@@ -1078,7 +1083,7 @@ def edge_debug_flag(platform):
     slot = random.randint(0, n - 1)
     out_plain = test_path("dbgp", ".img")
     out_debug = test_path("dbgd", ".img")
-    debug_flag = random.choice(["-u", "--debug"])
+    debug_flag = random.choice(["-D", "--debug"])
 
     rc1, stdout1b, err1 = verona(["-p", platform_flag(platform), "-d", img_plain, "-r", f"{slot}{sep()}{out_plain}"])
     rc2, stdout2b, err2 = verona(["-p", platform_flag(platform), "-d", img_debug, debug_flag, "-r", f"{slot}{sep()}{out_debug}"])
@@ -1163,7 +1168,7 @@ def edge_corrupted_table(platform):
     off_base = None
     kinds = ["bad_sig", "misaligned_len", "absurd_count"]
     kind = random.choice(kinds)
-    ops = random.sample(["-l", "-r", "-w", "-b", "-e"], 2)
+    ops = random.sample(["-l", "-r", "-w", "-B", "-R"], 2)
     for op in ops:
         img = fresh(platform)
         n = fwcount(img, platform)
@@ -1187,12 +1192,12 @@ def edge_corrupted_table(platform):
             rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", str(slot)])
         elif op == "-w":
             rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
-        elif op == "-b":
-            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-b", test_path("ctb", ".img"), "-r", str(slot)])
-        else:  # -e
+        elif op == "-B":
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-B", test_path("ctb", ".img"), "-r", str(slot)])
+        else:  # -R
             dummy = test_path("ctd", ".img")
             gen_random_file(dummy, 1024)
-            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-e", dummy])
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-R", dummy])
             cleanup(dummy)
         if rc == 2:
             record("pass", f"edge_corrupted_table platform={platform} kind={kind} op={op}")
@@ -1239,7 +1244,7 @@ def edge_backup_before_failed_write(platform):
     big = test_path("bf", ".bin")
     gen_random_file(big, boundary + 4096)
     backup = test_path("bfb", ".img")
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-b", backup, "-w", f"{slot}{sep()}{big}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-B", backup, "-w", f"{slot}{sep()}{big}"])
     backup_exists = os.path.exists(backup) and os.path.getsize(backup) > 0
     if rc == 3 and backup_exists:
         record("pass", f"edge_backup_before_failed_write platform={platform}")
@@ -1270,8 +1275,8 @@ def edge_backup_twice_same_second(platform):
     img = fresh(platform)
     n = fwcount(img, platform)
     slot = random.randint(0, n - 1)
-    rc1, out1, err1 = verona(["-p", platform_flag(platform), "-d", img, "-b", "-r", str(slot)])
-    rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-b", "-r", str(slot)])
+    rc1, out1, err1 = verona(["-p", platform_flag(platform), "-d", img, "-B", "-r", str(slot)])
+    rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-B", "-r", str(slot)])
     names = sorted(f for f in os.listdir(SCRATCH) if f.startswith(f"verona-table-backup-{platform}-"))
     detail = f"edge_backup_twice_same_second platform={platform} rc1={rc1} rc2={rc2} produced={names}"
     if rc1 == 0 and rc2 == 0:

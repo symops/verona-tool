@@ -53,7 +53,7 @@ type args struct {
 	version bool
 
 	platform string
-	disk     string
+	device   string
 
 	reads  []slotFile
 	writes []slotFile
@@ -130,7 +130,7 @@ func parseArgs(argv []string) (*args, error) {
 			a.version = true
 		case "y", "dry-run":
 			a.dryRun = true
-		case "u", "debug":
+		case "D", "debug":
 			a.debug = true
 		case "l", "list":
 			a.list = true
@@ -140,21 +140,21 @@ func parseArgs(argv []string) (*args, error) {
 				return nil, err
 			}
 			a.platform = v
-		case "d", "disk":
-			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-d/--disk")
+		case "d", "device":
+			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-d/--device")
 			if err != nil {
 				return nil, err
 			}
-			a.disk = v
-		case "e", "restore":
-			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-e/--restore")
+			a.device = v
+		case "R", "restore":
+			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-R/--restore")
 			if err != nil {
 				return nil, err
 			}
 			a.restore = v
-		case "b", "backup":
+		case "B", "backup":
 			a.backup = true
-			// -b/--backup FILE is optional. Only long form may carry it
+			// -B/--backup FILE is optional. Only long form may carry it
 			// attached (--backup=file); for the short form we peek at the
 			// next token and consume it only if it doesn't itself look
 			// like a flag.
@@ -219,7 +219,7 @@ func parseArgs(argv []string) (*args, error) {
 			if err := a.addShortcut(shortcutDTB, hasAttached, attached); err != nil {
 				return nil, err
 			}
-		case "o", "rootfs":
+		case "f", "rootfs":
 			if err := a.addShortcut(shortcutRootFS, hasAttached, attached); err != nil {
 				return nil, err
 			}

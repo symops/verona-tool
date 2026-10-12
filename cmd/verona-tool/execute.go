@@ -29,22 +29,22 @@ func execute(p *plan) int {
 		return exitArgs
 	}
 
-	disk := p.disk
-	if platform == verona.PlatformAuto && disk == "" {
-		fmt.Fprintln(os.Stderr, "error: -d/--disk is required when -p/--platform is auto")
+	device := p.device
+	if platform == verona.PlatformAuto && device == "" {
+		fmt.Fprintln(os.Stderr, "error: -d/--device is required when -p/--platform is auto")
 		return exitArgs
 	}
-	if disk == "" {
+	if device == "" {
 		if platform == verona.PlatformMonarch {
-			fmt.Fprintln(os.Stderr, "error: -d/--disk is required for the monarch/mch platform")
+			fmt.Fprintln(os.Stderr, "error: -d/--device is required for the monarch/mch platform")
 			return exitArgs
 		}
-		disk = "/dev/mmcblk0"
+		device = "/dev/mmcblk0"
 	}
 
 	if platform == verona.PlatformAuto {
-		dbg(p.debug, "platform=auto: probing both Monarch (GPT+FW_TABLE) and Duo (fixed offset) candidates on %s", disk)
-		f, ferr := os.Open(disk)
+		dbg(p.debug, "platform=auto: probing both Monarch (GPT+FW_TABLE) and Duo (fixed offset) candidates on %s", device)
+		f, ferr := os.Open(device)
 		if ferr != nil {
 			fmt.Fprintln(os.Stderr, "error:", ferr)
 			return exitTableInvalid
@@ -65,16 +65,16 @@ func execute(p *plan) int {
 	needWrite := !p.dryRun && (p.doRestore != "" || len(p.writes) > 0)
 	exclusive := needWrite
 
-	dev, err := verona.Open(disk, platform, needWrite)
+	dev, err := verona.Open(device, platform, needWrite)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitTableInvalid
 	}
 	defer dev.Close()
 	dbg(p.debug, "table located at byte offset %d on %s (signature+checksum verified, %d partitions, %d firmware entries)",
-		dev.TableOffset, disk, len(dev.Table.Parts), len(dev.Table.Fws))
+		dev.TableOffset, device, len(dev.Table.Parts), len(dev.Table.Fws))
 
-	dbg(p.debug, "acquiring %s lock on %s", map[bool]string{true: "exclusive", false: "shared"}[exclusive], disk)
+	dbg(p.debug, "acquiring %s lock on %s", map[bool]string{true: "exclusive", false: "shared"}[exclusive], device)
 	if err := dev.Lock(exclusive); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitLocked

@@ -65,8 +65,18 @@ def log_cmd(binary_name, args):
         f.write(binary_name + " " + shlex.join(args) + "\n")
 
 
+# A slot's real boundary can legitimately be gigabytes (Duo's "last by
+# offset" fallback is the whole device size -- an accepted, documented
+# limitation, not a bug). Generating/writing/verifying a multi-GB random
+# file under qemu emulation to fuzz such a slot is impractically slow and
+# not what this randomized loop is for (the boundary math itself is
+# covered by targeted unit tests and the earlier truncated-image runs);
+# scenarios needing a "boundary" skip themselves when it exceeds this cap.
+MAX_PRACTICAL_BOUNDARY = 64 * 1024 * 1024
+
+
 def run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=False, timeout=60)
+    p = subprocess.run(cmd, capture_output=True, text=False, timeout=180)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -248,7 +258,7 @@ def scenario_single_write(platform):
     n = fwcount(img_a, platform)
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
-    if boundary < 16:
+    if boundary < 16 or boundary > MAX_PRACTICAL_BOUNDARY:
         cleanup(img_a, img_b)
         return
     size_choice = random.choice(["small", "near", "aligned512"])
@@ -371,7 +381,7 @@ def scenario_sequential_overwrites(platform):
     n = fwcount(img_a, platform)
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
-    if boundary < 16:
+    if boundary < 16 or boundary > MAX_PRACTICAL_BOUNDARY:
         cleanup(img_a)
         return
     rounds = random.choice([2, 3])
@@ -415,6 +425,9 @@ def scenario_refusal(platform):
     n = fwcount(img_a, platform)
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
+    if boundary > MAX_PRACTICAL_BOUNDARY:
+        cleanup(img_a)
+        return
     size = boundary + random.randint(1, 1 << 16)
     src = os.path.join(SCRATCH, f"over-{random.randint(0,1<<30)}.bin")
     gen_random_file(src, size)
@@ -637,7 +650,7 @@ def scenario_shortcut_write(platform):
     b0 = duo_boundary(img, slots[0]) if platform == "duo" else monarch_boundary(img, slots[0])
     b1 = duo_boundary(img, slots[1]) if platform == "duo" else monarch_boundary(img, slots[1])
     min_b = min(b0, b1)
-    if min_b < 16:
+    if min_b < 16 or min_b > MAX_PRACTICAL_BOUNDARY:
         cleanup(img)
         return
 
@@ -807,6 +820,9 @@ def edge_dry_run_overflow(platform):
     n = fwcount(img, platform)
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img, slot) if platform == "duo" else monarch_boundary(img, slot)
+    if boundary > MAX_PRACTICAL_BOUNDARY:
+        cleanup(img)
+        return
     src = os.path.join(SCRATCH, f"ov-{random.randint(0,1<<30)}.bin")
     gen_random_file(src, boundary + 1024)
     before = sha256(img)
@@ -1059,6 +1075,9 @@ def edge_backup_before_failed_write(platform):
     n = fwcount(img, platform)
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img, slot) if platform == "duo" else monarch_boundary(img, slot)
+    if boundary > MAX_PRACTICAL_BOUNDARY:
+        cleanup(img)
+        return
     big = os.path.join(SCRATCH, f"bf-{random.randint(0,1<<30)}.bin")
     gen_random_file(big, boundary + 4096)
     backup = os.path.join(SCRATCH, f"bfb-{random.randint(0,1<<30)}.img")

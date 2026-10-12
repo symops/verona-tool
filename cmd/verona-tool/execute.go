@@ -8,6 +8,18 @@ import (
 	"github.com/symops/verona-tool/pkg/verona"
 )
 
+// dbg prints a line of medium-verbosity internal diagnostic output
+// (-u/--debug only): where the table was located, boundaries computed,
+// lock state, bytes moved, checksums -- anything useful for understanding
+// what verona-tool did internally, beyond the normal one-line-per-action
+// summary it always prints regardless of this flag.
+func dbg(debug bool, format string, args ...interface{}) {
+	if !debug {
+		return
+	}
+	fmt.Printf("[debug] "+format+"\n", args...)
+}
+
 func execute(p *plan) int {
 	printWarnings(p)
 
@@ -31,6 +43,7 @@ func execute(p *plan) int {
 	}
 
 	if platform == verona.PlatformAuto {
+		dbg(p.debug, "platform=auto: probing both Monarch (GPT+FW_TABLE) and Duo (fixed offset) candidates on %s", disk)
 		f, ferr := os.Open(disk)
 		if ferr != nil {
 			fmt.Fprintln(os.Stderr, "error:", ferr)
@@ -58,28 +71,32 @@ func execute(p *plan) int {
 		return exitTableInvalid
 	}
 	defer dev.Close()
+	dbg(p.debug, "table located at byte offset %d on %s (signature+checksum verified, %d partitions, %d firmware entries)",
+		dev.TableOffset, disk, len(dev.Table.Parts), len(dev.Table.Fws))
 
+	dbg(p.debug, "acquiring %s lock on %s", map[bool]string{true: "exclusive", false: "shared"}[exclusive], disk)
 	if err := dev.Lock(exclusive); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitLocked
 	}
+	dbg(p.debug, "lock acquired")
 
 	switch {
 	case p.doList:
 		printTable(dev)
 		return exitOK
 	case p.doRestore != "":
-		return doRestore(dev, p.doRestore, p.dryRun)
+		return doRestore(dev, p.doRestore, p.dryRun, p.debug)
 	}
 
 	if p.doBackup {
-		if code := doBackup(dev, p.backupFile, p.dryRun); code != exitOK {
+		if code := doBackup(dev, p.backupFile, p.dryRun, p.debug); code != exitOK {
 			return code
 		}
 	}
 
 	for _, r := range p.reads {
-		if code := doRead(dev, r, p.dryRun); code != exitOK {
+		if code := doRead(dev, r, p.dryRun, p.debug); code != exitOK {
 			return code
 		}
 	}
@@ -102,6 +119,7 @@ func execute(p *plan) int {
 	overflowed := false
 	for _, w := range p.writes {
 		b, err := dev.Boundary(w.slot)
+		dbg(p.debug, "slot %d: computed boundary %d bytes, file size %d bytes", w.slot, b, fileSizes[w.slot])
 		if err != nil {
 			if p.dryRun {
 				fmt.Fprintln(os.Stderr, "would fail:", err)
@@ -139,20 +157,21 @@ func execute(p *plan) int {
 	}
 
 	for _, w := range p.writes {
-		if code := doWrite(dev, w); code != exitOK {
+		if code := doWrite(dev, w, p.debug); code != exitOK {
 			return code
 		}
 	}
 
-	return finalizeTable(dev)
+	return finalizeTable(dev, p.debug)
 }
 
-func doRead(dev *verona.Device, r readOp, dryRun bool) int {
+func doRead(dev *verona.Device, r readOp, dryRun, debug bool) int {
 	if r.slot < 0 || r.slot >= len(dev.Table.Fws) {
 		fmt.Fprintf(os.Stderr, "error: slot %d out of range (table has %d entries)\n", r.slot, len(dev.Table.Fws))
 		return exitSlotRange
 	}
 	fw := dev.Table.Fws[r.slot]
+	dbg(debug, "slot %d: offset=0x%08x length=%d stored_checksum=0x%08x", r.slot, fw.Offset, fw.Length, fw.Checksum)
 	if dryRun {
 		fmt.Printf("would read %d bytes from slot %d (%s) into %s\n", fw.Length, r.slot, fw.FwType(), r.file)
 		return exitOK
@@ -164,6 +183,7 @@ func doRead(dev *verona.Device, r readOp, dryRun bool) int {
 			return exitTableInvalid
 		}
 	}
+	dbg(debug, "read %d bytes from offset 0x%08x", len(buf), fw.Offset)
 	if err := os.WriteFile(r.file, buf, 0644); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitArgs
@@ -172,13 +192,14 @@ func doRead(dev *verona.Device, r readOp, dryRun bool) int {
 	return exitOK
 }
 
-func doWrite(dev *verona.Device, w writeOp) int {
+func doWrite(dev *verona.Device, w writeOp, debug bool) int {
 	data, err := os.ReadFile(w.file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitArgs
 	}
 	fw := &dev.Table.Fws[w.slot]
+	dbg(debug, "slot %d: writing %d bytes to offset 0x%08x", w.slot, len(data), fw.Offset)
 	if _, err := dev.WriteAt(data, int64(fw.Offset)); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitTableInvalid
@@ -187,6 +208,7 @@ func doWrite(dev *verona.Device, w writeOp) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitVerifyFailed
 	}
+	dbg(debug, "fsync done, reading back %d bytes from offset 0x%08x to verify", len(data), fw.Offset)
 	readback := make([]byte, len(data))
 	if len(data) > 0 {
 		if _, err := dev.ReadAt(readback, int64(fw.Offset)); err != nil {
@@ -198,6 +220,7 @@ func doWrite(dev *verona.Device, w writeOp) int {
 		fmt.Fprintf(os.Stderr, "error: post-write verification failed for slot %d\n", w.slot)
 		return exitVerifyFailed
 	}
+	dbg(debug, "read-back verification OK")
 
 	fw.Length = uint32(len(data))
 	fw.Paddings = verona.RoundUpTo512(fw.Length)
@@ -206,16 +229,18 @@ func doWrite(dev *verona.Device, w writeOp) int {
 		sum += uint32(b)
 	}
 	fw.Checksum = sum
+	dbg(debug, "slot %d: updated Length=%d Paddings=%d Checksum=0x%08x in memory (table not yet written back)", w.slot, fw.Length, fw.Paddings, fw.Checksum)
 
 	fmt.Printf("wrote slot %d (%s): %d bytes from %s, checksum 0x%08x\n", w.slot, fw.FwType(), len(data), w.file, sum)
 	return exitOK
 }
 
-func finalizeTable(dev *verona.Device) int {
+func finalizeTable(dev *verona.Device, debug bool) int {
 	if err := dev.Table.Encode(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitTableInvalid
 	}
+	dbg(debug, "table re-encoded, %d bytes, new checksum 0x%08x, writing to offset %d", len(dev.Table.Raw), dev.Table.Header.Checksum, dev.TableOffset)
 	if _, err := dev.WriteAt(dev.Table.Raw, dev.TableOffset); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitTableInvalid
@@ -233,15 +258,17 @@ func finalizeTable(dev *verona.Device) int {
 		fmt.Fprintln(os.Stderr, "error: post-write verification of the table failed")
 		return exitVerifyFailed
 	}
+	dbg(debug, "table read-back verification OK")
 	fmt.Printf("table checksum recalculated: 0x%08x\n", dev.Table.Header.Checksum)
 	return exitOK
 }
 
-func doBackup(dev *verona.Device, file string, dryRun bool) int {
+func doBackup(dev *verona.Device, file string, dryRun, debug bool) int {
 	if dryRun {
 		fmt.Printf("would back up %d bytes of table to %s\n", dev.Table.Header.Paddings, file)
 		return exitOK
 	}
+	dbg(debug, "backing up %d bytes from table offset %d to %s", dev.Table.Header.Paddings, dev.TableOffset, file)
 	raw := make([]byte, dev.Table.Header.Paddings)
 	if _, err := dev.ReadAt(raw, dev.TableOffset); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -255,7 +282,7 @@ func doBackup(dev *verona.Device, file string, dryRun bool) int {
 	return exitOK
 }
 
-func doRestore(dev *verona.Device, file string, dryRun bool) int {
+func doRestore(dev *verona.Device, file string, dryRun, debug bool) int {
 	raw, err := os.ReadFile(file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -280,11 +307,13 @@ func doRestore(dev *verona.Device, file string, dryRun bool) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitTableInvalid
 	}
+	dbg(debug, "backup file %s: signature+checksum valid, %d bytes (Paddings=%d)", file, len(raw), hdr.Paddings)
 	bound, err := dev.TableRegionBoundary()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitTableInvalid
 	}
+	dbg(debug, "table region boundary on target device: %d bytes available", bound)
 	if uint64(hdr.Paddings) > bound {
 		fmt.Fprintf(os.Stderr, "error: backup table size %d bytes exceeds the %d bytes available for the table region on this device\n", hdr.Paddings, bound)
 		return exitTableInvalid

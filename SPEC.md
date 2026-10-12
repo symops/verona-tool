@@ -148,6 +148,12 @@ without writing anything. Exits 0 whenever the simulation itself ran
 to completion (even if it reports that the real run would fail).
 Alone (no action flag) is a usage error.
 
+`-u`/`--debug` -- compatible with everything. Prints extra internal
+diagnostics (table location, computed boundaries, lock acquisition,
+byte offsets, checksums) alongside the normal output. Purely additive:
+has no effect on what is actually done or on the resulting file/table
+state.
+
 `-h`/`--help`, `-v`/`--version` -- fully exclusive, must be used
 alone. Version author: Symo <symops@gmail.com>.
 

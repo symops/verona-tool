@@ -26,6 +26,86 @@ RESULTS = "/root/work/results.jsonl"
 CMDLOG = "/root/work/commands.log"
 DUO_TABLE_OFFSET = 6422528
 
+# --- test-data diversity helpers -------------------------------------------
+
+PLATFORM_ALIASES = {
+    "mch": ["m", "monarch", "mch", "home", "auto"],
+    "duo": ["p", "pelican", "mchd", "duo", "auto"],
+}
+
+
+def platform_flag(platform):
+    """A randomly chosen valid -p/--platform alias for this platform,
+    including 'auto' as a regular pick (not just in the dedicated
+    auto_detect scenario) -- not always the canonical 'duo'/'mch' form."""
+    return random.choice(PLATFORM_ALIASES[platform])
+
+
+def sep():
+    """A randomly chosen SLOT/FILE separator: ':' or '='. Both are
+    equally valid per SPEC.md; using only one everywhere under-exercises
+    the other."""
+    return random.choice([":", "="])
+
+
+_NAME_STYLES = ["ascii", "cyrillic", "cjk", "mixed"]
+
+
+def test_filename(prefix, ext=".bin"):
+    """A random-looking basename, varying script/charset: plain ASCII,
+    Cyrillic, CJK, or a mix -- exercises non-Latin filenames end to end
+    (open/read/write/log), not just ASCII ones."""
+    n = random.randint(0, 1 << 30)
+    style = random.choice(_NAME_STYLES)
+    if style == "ascii":
+        return f"{prefix}-{n}{ext}"
+    if style == "cyrillic":
+        return f"тест-{prefix}-{n}{ext}"
+    if style == "cjk":
+        return f"测试-{prefix}-{n}{ext}"
+    return f"{prefix}-тест-测试-{n}{ext}"
+
+
+def test_path(prefix, ext=".bin"):
+    """A full path for a scratch file, varying style: absolute (most
+    common), a relative path through a subdirectory, or a bare filename
+    with no directory component at all (resolved against the current
+    working directory, which main() sets to SCRATCH)."""
+    name = test_filename(prefix, ext)
+    style = random.choice(["absolute", "relative_subdir", "bare"])
+    if style == "absolute":
+        return os.path.join(SCRATCH, name)
+    if style == "relative_subdir":
+        subdir = f"sub-{random.randint(0, 999)}"
+        os.makedirs(os.path.join(SCRATCH, subdir), exist_ok=True)
+        return os.path.join(".", subdir, name)
+    return name  # bare, relative to CWD (== SCRATCH)
+
+
+_DEVICE_NAMES = ["/dev/sdb", "/dev/sdc", "/dev/sdx", "/dev/mmcblk0", "/dev/mmcblk1"]
+_DEVICE_PATH_PROBABILITY = 0.10
+
+
+def maybe_as_device_path(real_path):
+    """~10% of the time, create a symlink at a randomly chosen real-
+    device-looking path (/dev/sdX, /dev/mmcblkN) pointing at real_path,
+    and return that symlink path instead -- exercising -d against
+    something that looks like an actual block device, not only plain
+    scratch files. verona-tool just opens whatever path it's given, so
+    this is transparent to it; Python's own file operations (os.path.*,
+    open()) also transparently follow the symlink, so callers can use
+    the returned path uniformly for both the -d argument and any direct
+    byte-level verification."""
+    if random.random() >= _DEVICE_PATH_PROBABILITY:
+        return real_path
+    name = random.choice(_DEVICE_NAMES)
+    try:
+        os.remove(name)
+    except OSError:
+        pass
+    os.symlink(real_path, name)
+    return name
+
 FW_TYPES = ["Reserved","Bootcode","Kernel","RescueDeviceTree","KernelDeviceTree",
     "RescueRootFS","KernelRootFS","Audio","AudioFile","VideoFile","Ext4","Ubifs",
     "Squash","Ext3","Odd","YAFFS2","ISO","Swap","NTFS","JFFS2","ImageFile",
@@ -195,6 +275,12 @@ def monarch_boundary(img, slot):
 
 
 def fresh(platform):
+    """A fresh scratch copy of the platform's golden image. ~10% of the
+    time, returns a /dev/sdX- or /dev/mmcblkN-style symlink pointing at
+    the real copy instead of the plain scratch path itself, so the
+    returned value can be used uniformly both as the -d argument and for
+    direct Python-side byte verification (os.path.*/open() follow the
+    symlink transparently either way)."""
     name = f"{platform}-{random.randint(0, 1 << 30)}.img"
     dst = os.path.join(SCRATCH, name)
     src = GOLDEN_DUO if platform == "duo" else GOLDEN_MCH
@@ -202,13 +288,18 @@ def fresh(platform):
         subprocess.run(["cp", "--sparse=always", src, dst], check=True)
     else:
         subprocess.run(["cp", src, dst], check=True)
-    return dst
+    return maybe_as_device_path(dst)
 
 
 def cleanup(*paths):
     for p in paths:
         try:
-            os.remove(p)
+            if os.path.islink(p):
+                target = os.path.realpath(p)
+                os.remove(p)
+                os.remove(target)
+            else:
+                os.remove(p)
         except OSError:
             pass
 
@@ -270,10 +361,10 @@ def scenario_single_write(platform):
         size = (boundary // 512) * 512
         if size == 0 or size > boundary:
             size = 512
-    src = os.path.join(SCRATCH, f"src-{random.randint(0,1<<30)}.bin")
+    src = test_path("src", ".bin")
     gen_random_file(src, size)
 
-    rc, out, err = verona(["-p", platform, "-d", img_a, "-w", f"{slot}:{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-w", f"{slot}{sep()}{src}"])
     if rc != 0:
         record("genuine_failure", f"single_write platform={platform} slot={slot} size={size} verona rc={rc} err={err!r}")
         cleanup(img_a, img_b, src)
@@ -310,7 +401,7 @@ def scenario_single_write(platform):
 
         off_b, _, _ = monarch_table_offset(img_b)
         h_b = read_header(img_b, off_b)
-        table_file = os.path.join(SCRATCH, f"tbl-{random.randint(0,1<<30)}.img")
+        table_file = test_path("tbl", ".img")
         with open(table_file, "wb") as f:
             f.write(open(img_b, "rb").read()[off_b:off_b + 32 + h_b["plen"] + h_b["flen"]])
         type_name = FW_TYPES[read_fw_entries(img_b, off_b, h_b["plen"], h_b["flen"])[slot]["type"]]
@@ -389,10 +480,10 @@ def scenario_sequential_overwrites(platform):
     ok = True
     for r in range(rounds):
         size = random.randint(1, min(boundary, 1 << 20))
-        src = os.path.join(SCRATCH, f"seq-{random.randint(0,1<<30)}.bin")
+        src = test_path("seq", ".bin")
         gen_random_file(src, size)
         srcs.append((src, size))
-        rc, out, err = verona(["-p", platform, "-d", img_a, "-w", f"{slot}:{src}"])
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-w", f"{slot}{sep()}{src}"])
         if rc != 0:
             record("genuine_failure", f"sequential_overwrite platform={platform} slot={slot} round={r} rc={rc} err={err!r}")
             ok = False
@@ -403,7 +494,7 @@ def scenario_sequential_overwrites(platform):
             ok = False
             break
         # Also verify via verona-tool's own -r, after EACH round.
-        rc2, out2, err2 = verona(["-p", platform, "-d", img_a, "-r", f"{slot}:{src}.readback"])
+        rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img_a, "-r", f"{slot}{sep()}{src}.readback"])
         if rc2 != 0:
             record("genuine_failure", f"sequential_overwrite readback platform={platform} slot={slot} round={r} rc={rc2}")
             ok = False
@@ -429,10 +520,10 @@ def scenario_refusal(platform):
         cleanup(img_a)
         return
     size = boundary + random.randint(1, 1 << 16)
-    src = os.path.join(SCRATCH, f"over-{random.randint(0,1<<30)}.bin")
+    src = test_path("over", ".bin")
     gen_random_file(src, size)
     before = sha256(img_a)
-    rc, out, err = verona(["-p", platform, "-d", img_a, "-w", f"{slot}:{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-w", f"{slot}{sep()}{src}"])
     after = sha256(img_a)
     if rc == 3 and before == after:
         record("pass", f"refusal platform={platform} slot={slot} boundary={boundary} size={size}")
@@ -444,16 +535,17 @@ def scenario_refusal(platform):
 def scenario_backup_restore_list(platform):
     img_a = fresh(platform)
     n = fwcount(img_a, platform)
-    backup_file = os.path.join(SCRATCH, f"bak-{random.randint(0,1<<30)}.img")
+    backup_file = test_path("bak", ".img")
 
     off, _, _ = (monarch_table_offset(img_a) if platform == "mch" else (DUO_TABLE_OFFSET, None, None))
     h = read_header(img_a, off)
     table_before = open(img_a, "rb").read()[off:off + h["paddings"]]
 
-    # -b (explicit filename) combined with a harmless -r 0 (list/backup
+    # -b (explicit filename) combined with a harmless -r SLOT (list/backup
     # alone with no -r/-w would still be valid per spec, but exercising
     # -b alongside an ordinary -r is also part of what we want covered).
-    rc, out, err = verona(["-p", platform, "-d", img_a, "-b", backup_file, "-r", "0"])
+    read_slot = random.randint(0, n - 1)
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-b", backup_file, "-r", str(read_slot)])
     if rc != 0:
         record("genuine_failure", f"backup platform={platform} rc={rc} err={err!r}")
         cleanup(img_a, backup_file)
@@ -462,22 +554,22 @@ def scenario_backup_restore_list(platform):
         backup_bytes = f.read()
     if backup_bytes != table_before:
         record("genuine_failure", f"backup platform={platform}: backup file does not match pre-backup table bytes")
-        cleanup(img_a, backup_file, os.path.join(os.getcwd(), "0.img"))
+        cleanup(img_a, backup_file, os.path.join(os.getcwd(), f"{read_slot}.img"))
         return
 
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
     if boundary >= 16:
-        src = os.path.join(SCRATCH, f"mut-{random.randint(0,1<<30)}.bin")
+        src = test_path("mut", ".bin")
         gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
-        rc, out, err = verona(["-p", platform, "-d", img_a, "-w", f"{slot}:{src}"])
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-w", f"{slot}{sep()}{src}"])
         cleanup(src)
         if rc != 0:
             record("genuine_failure", f"backup_restore mutate platform={platform} rc={rc} err={err!r}")
             cleanup(img_a, backup_file)
             return
 
-    rc, out, err = verona(["-p", platform, "-d", img_a, "-e", backup_file])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-e", backup_file])
     if rc != 0:
         record("genuine_failure", f"restore platform={platform} rc={rc} err={err!r}")
         cleanup(img_a, backup_file)
@@ -490,7 +582,7 @@ def scenario_backup_restore_list(platform):
         record("genuine_failure", f"backup_restore platform={platform}: table not byte-identical after restore")
     cleanup(img_a, backup_file)
     try:
-        os.remove(os.path.join(os.getcwd(), "0.img"))
+        os.remove(os.path.join(os.getcwd(), f"{read_slot}.img"))
     except OSError:
         pass
 
@@ -517,7 +609,7 @@ def scenario_list_check(platform):
     h = read_header(img, off)
     fws = read_fw_entries(img, off, h["plen"], h["flen"])
 
-    rc, out, err = verona(["-p", platform, "-d", img, "-l"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-l"])
     if rc != 0:
         record("genuine_failure", f"list_check platform={platform} rc={rc} err={err!r}")
         cleanup(img)
@@ -586,7 +678,7 @@ def scenario_shortcut_read(platform):
     flag = random.choice([f"--{name}", {"kernel": "-k", "dtb": "-t", "rootfs": "-o"}[name]])
     slots = SHORTCUT_SLOTS[name]
 
-    rc, out, err = verona(["-p", platform, "-d", img, "-r", flag])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", flag])
     if rc != 0:
         record("genuine_failure", f"shortcut_read platform={platform} name={name} rc={rc} err={err!r}")
         cleanup(img)
@@ -630,14 +722,14 @@ def scenario_shortcut_write(platform):
     mode = random.choice(["normal", "oversized_half", "duplicate_conflict"])
 
     if mode == "duplicate_conflict":
-        src = os.path.join(SCRATCH, f"dupe-{random.randint(0,1<<30)}.bin")
+        src = test_path("dupe", ".bin")
         gen_random_file(src, 64)
         before = sha256(img)
         # Write-mode shortcuts only accept the '=FILE' attachment on the
         # long option form (per SPEC.md); the short forms (-k/-t/-o) carry
         # no value in write mode. Using the long form twice is still a
         # valid way to exercise the duplicate-shortcut conflict check.
-        rc, out, err = verona(["-p", platform, "-d", img, "-w",
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w",
                                 f"{flag_long}={src}", "-w", f"{flag_long}={src}"])
         after = sha256(img)
         if rc == 5 and before == after:
@@ -658,13 +750,13 @@ def scenario_shortcut_write(platform):
         size = min_b + random.randint(1, 1 << 16)
     else:
         size = random.randint(1, min(min_b, 1 << 16))
-    src = os.path.join(SCRATCH, f"sw-{random.randint(0,1<<30)}.bin")
+    src = test_path("sw", ".bin")
     gen_random_file(src, size)
     before = sha256(img)
 
     # Write-mode shortcuts only accept '=FILE' on the long option form.
     flag = flag_long
-    rc, out, err = verona(["-p", platform, "-d", img, "-w", f"{flag}={src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{flag}={src}"])
     after = sha256(img)
 
     if mode == "oversized_half":
@@ -783,12 +875,12 @@ def edge_duplicate_write_direct(platform):
     img = fresh(platform)
     n = fwcount(img, platform)
     slot = random.randint(0, n - 1)
-    f1 = os.path.join(SCRATCH, f"d1-{random.randint(0,1<<30)}.bin")
-    f2 = os.path.join(SCRATCH, f"d2-{random.randint(0,1<<30)}.bin")
+    f1 = test_path("d1", ".bin")
+    f2 = test_path("d2", ".bin")
     gen_random_file(f1, 32)
     gen_random_file(f2, 32)
     before = sha256(img)
-    rc, out, err = verona(["-p", platform, "-d", img, "-w", f"{slot}:{f1}", "-w", f"{slot}:{f2}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{f1}", "-w", f"{slot}{sep()}{f2}"])
     after = sha256(img)
     if rc == 5 and before == after:
         record("pass", f"edge_duplicate_write_direct platform={platform} slot={slot}")
@@ -801,12 +893,12 @@ def edge_duplicate_write_shortcut_collision(platform):
     img = fresh(platform)
     name = random.choice(list(SHORTCUT_SLOTS))
     colliding_slot = SHORTCUT_SLOTS[name][0]
-    f1 = os.path.join(SCRATCH, f"c1-{random.randint(0,1<<30)}.bin")
-    f2 = os.path.join(SCRATCH, f"c2-{random.randint(0,1<<30)}.bin")
+    f1 = test_path("c1", ".bin")
+    f2 = test_path("c2", ".bin")
     gen_random_file(f1, 32)
     gen_random_file(f2, 32)
     before = sha256(img)
-    rc, out, err = verona(["-p", platform, "-d", img, "-w", f"--{name}={f1}", "-w", f"{colliding_slot}:{f2}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"--{name}={f1}", "-w", f"{colliding_slot}{sep()}{f2}"])
     after = sha256(img)
     if rc == 5 and before == after:
         record("pass", f"edge_duplicate_write_shortcut_collision platform={platform} name={name}")
@@ -823,10 +915,10 @@ def edge_dry_run_overflow(platform):
     if boundary > MAX_PRACTICAL_BOUNDARY:
         cleanup(img)
         return
-    src = os.path.join(SCRATCH, f"ov-{random.randint(0,1<<30)}.bin")
+    src = test_path("ov", ".bin")
     gen_random_file(src, boundary + 1024)
     before = sha256(img)
-    rc, out, err = verona(["-p", platform, "-d", img, "-y", "-w", f"{slot}:{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-y", "-w", f"{slot}{sep()}{src}"])
     after = sha256(img)
     text = err.decode("utf-8", "replace")
     if rc == 0 and before == after and "would fail" in text:
@@ -840,10 +932,10 @@ def edge_dry_run_conflict(platform):
     img = fresh(platform)
     n = fwcount(img, platform)
     slot = random.randint(0, n - 1)
-    src = os.path.join(SCRATCH, f"dc-{random.randint(0,1<<30)}.bin")
+    src = test_path("dc", ".bin")
     gen_random_file(src, 32)
     before = sha256(img)
-    rc, out, err = verona(["-p", platform, "-d", img, "-y", "-w", f"{slot}:{src}", "-w", f"{slot}:{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-y", "-w", f"{slot}{sep()}{src}", "-w", f"{slot}{sep()}{src}"])
     after = sha256(img)
     text = err.decode("utf-8", "replace")
     if rc == 0 and before == after and "would fail" in text:
@@ -857,7 +949,7 @@ def edge_restore_corrupted(platform):
     img = fresh(platform)
     off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
     h = read_header(img, off)
-    backup = os.path.join(SCRATCH, f"rc-{random.randint(0,1<<30)}.img")
+    backup = test_path("rc", ".img")
     with open(img, "rb") as f:
         f.seek(off)
         good = f.read(h["paddings"])
@@ -865,7 +957,7 @@ def edge_restore_corrupted(platform):
     with open(backup, "wb") as f:
         f.write(good[: len(good) // 2])
     before = open_table_bytes(img, off, h["paddings"])
-    rc, out, err = verona(["-p", platform, "-d", img, "-e", backup])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-e", backup])
     after = open_table_bytes(img, off, h["paddings"])
     if rc == 2 and before == after:
         record("pass", f"edge_restore_corrupted platform={platform}")
@@ -903,7 +995,7 @@ def edge_restore_oversized_paddings(platform):
     img = fresh(platform)
     off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
     h = read_header(img, off)
-    backup = os.path.join(SCRATCH, f"ro-{random.randint(0,1<<30)}.img")
+    backup = test_path("ro", ".img")
     with open(img, "rb") as f:
         f.seek(off)
         good = f.read(h["paddings"])
@@ -919,7 +1011,7 @@ def edge_restore_oversized_paddings(platform):
     boundary = table_region_boundary(img, platform)
     write_table_header(backup, 0, paddings=boundary + 4096)
     before = open_table_bytes(img, off, h["paddings"])
-    rc, out, err = verona(["-p", platform, "-d", img, "-e", backup])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-e", backup])
     after = open_table_bytes(img, off, h["paddings"])
     if rc == 2 and before == after:
         record("pass", f"edge_restore_oversized_paddings platform={platform}")
@@ -943,7 +1035,7 @@ def edge_garbage_slots(platform):
     cases = [("-1", {1, 4}), ("abc", {1}), ("99999999", {4})]
     ok = True
     for val, acceptable_rc in cases:
-        rc, out, err = run(QEMU + [VERONA, "-p", platform, "-d", img, "-r", val])
+        rc, out, err = run(QEMU + [VERONA, "-p", platform_flag(platform), "-d", img, "-r", val])
         if rc not in acceptable_rc:
             record("genuine_failure", f"edge_garbage_slots platform={platform} val={val} rc={rc} not in {acceptable_rc}")
             ok = False
@@ -952,8 +1044,70 @@ def edge_garbage_slots(platform):
     cleanup(img)
 
 
+def edge_out_of_range_slot(platform):
+    """A numerically well-formed, plausible-looking slot number that is
+    simply past the end of the real table (fwcount + a small offset) must
+    be refused with the specific 'slot index out of range' error (exit 4)
+    -- distinct from edge_garbage_slots's negative/non-numeric/absurd
+    inputs, which are rejected earlier as plain exit-1 argument errors."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    slot = n + random.randint(1, 500)
+    src = test_path("oor", ".bin")
+    gen_random_file(src, 32)
+    ok = True
+    rc_r, out_r, err_r = verona(["-p", platform_flag(platform), "-d", img, "-r", str(slot)])
+    if rc_r != 4:
+        record("genuine_failure", f"edge_out_of_range_slot platform={platform} slot={slot} -r rc={rc_r} err={err_r!r}")
+        ok = False
+    rc_w, out_w, err_w = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
+    if rc_w != 4:
+        record("genuine_failure", f"edge_out_of_range_slot platform={platform} slot={slot} -w rc={rc_w} err={err_w!r}")
+        ok = False
+    if ok:
+        record("pass", f"edge_out_of_range_slot platform={platform} slot={slot} (fwcount={n})")
+    cleanup(img, src, os.path.join(SCRATCH, f"{slot}.img"))
+
+
+def edge_debug_flag(platform):
+    """-u/--debug must produce visibly more output than the same operation
+    without it, and must not change the resulting file/table state at all."""
+    img_plain = fresh(platform)
+    img_debug = fresh(platform)
+    n = fwcount(img_plain, platform)
+    slot = random.randint(0, n - 1)
+    out_plain = test_path("dbgp", ".img")
+    out_debug = test_path("dbgd", ".img")
+    debug_flag = random.choice(["-u", "--debug"])
+
+    rc1, stdout1b, err1 = verona(["-p", platform_flag(platform), "-d", img_plain, "-r", f"{slot}{sep()}{out_plain}"])
+    rc2, stdout2b, err2 = verona(["-p", platform_flag(platform), "-d", img_debug, debug_flag, "-r", f"{slot}{sep()}{out_debug}"])
+    stdout1 = stdout1b.decode("utf-8", "replace")
+    stdout2 = stdout2b.decode("utf-8", "replace")
+
+    ok = True
+    if rc1 != 0 or rc2 != 0:
+        record("genuine_failure", f"edge_debug_flag platform={platform} slot={slot} rc1={rc1} rc2={rc2} err1={err1!r} err2={err2!r}")
+        ok = False
+    if "[debug]" in stdout1:
+        record("genuine_failure", f"edge_debug_flag platform={platform}: plain run unexpectedly contains [debug] output")
+        ok = False
+    if "[debug]" not in stdout2 or len(stdout2.splitlines()) <= len(stdout1.splitlines()):
+        record("genuine_failure", f"edge_debug_flag platform={platform}: -u run not visibly more verbose (plain={len(stdout1.splitlines())} lines, debug={len(stdout2.splitlines())} lines)")
+        ok = False
+    if sha256(img_plain) != sha256(img_debug):
+        record("genuine_failure", f"edge_debug_flag platform={platform}: resulting device state differs between plain and -u runs")
+        ok = False
+    if os.path.exists(out_plain) and os.path.exists(out_debug) and open(out_plain, "rb").read() != open(out_debug, "rb").read():
+        record("genuine_failure", f"edge_debug_flag platform={platform}: read-out file contents differ between plain and -u runs")
+        ok = False
+    if ok:
+        record("pass", f"edge_debug_flag platform={platform} slot={slot} flag={debug_flag}")
+    cleanup(img_plain, img_debug, out_plain, out_debug)
+
+
 def edge_dry_run_alone(platform):
-    rc, out, err = verona(["-p", platform, "-y"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-y"])
     if rc == 1:
         record("pass", f"edge_dry_run_alone platform={platform}")
     else:
@@ -967,13 +1121,13 @@ def edge_concurrent_write_lock(platform):
     img = fresh(platform)
     n = fwcount(img, platform)
     slot = random.randint(0, n - 1)
-    src = os.path.join(SCRATCH, f"lk-{random.randint(0,1<<30)}.bin")
+    src = test_path("lk", ".bin")
     gen_random_file(src, 32)
     fd = os.open(img, os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         t0 = time.time()
-        rc, out, err = verona(["-p", platform, "-d", img, "-w", f"{slot}:{src}"])
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
         elapsed = time.time() - t0
         if rc == 7 and elapsed < 5:
             record("pass", f"edge_concurrent_write_lock platform={platform}")
@@ -988,17 +1142,19 @@ def edge_concurrent_read_shared(platform):
     """A shared (read) lock held externally must NOT block a verona-tool
     read-only invocation (-r) against the same -d."""
     img = fresh(platform)
+    n = fwcount(img, platform)
+    slot = random.randint(0, n - 1)
     fd = os.open(img, os.O_RDONLY)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        rc, out, err = verona(["-p", platform, "-d", img, "-r", "0"])
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", str(slot)])
         if rc == 0:
             record("pass", f"edge_concurrent_read_shared platform={platform}")
         else:
             record("genuine_failure", f"edge_concurrent_read_shared platform={platform} rc={rc} err={err!r}")
     finally:
         os.close(fd)
-    cleanup(img, os.path.join(SCRATCH, "0.img"))
+    cleanup(img, os.path.join(SCRATCH, f"{slot}.img"))
 
 
 def edge_corrupted_table(platform):
@@ -1010,6 +1166,8 @@ def edge_corrupted_table(platform):
     ops = random.sample(["-l", "-r", "-w", "-b", "-e"], 2)
     for op in ops:
         img = fresh(platform)
+        n = fwcount(img, platform)
+        slot = random.randint(0, n - 1)
         off = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img)[0]
         with open(img, "r+b") as f:
             f.seek(off)
@@ -1021,30 +1179,30 @@ def edge_corrupted_table(platform):
             else:
                 f.seek(off + 28)
                 f.write(struct.pack("<I", 20000 * 32))  # fwcount > 10000 cap
-        src = os.path.join(SCRATCH, f"ct-{random.randint(0,1<<30)}.bin")
+        src = test_path("ct", ".bin")
         gen_random_file(src, 32)
         if op == "-l":
-            rc, out, err = verona(["-p", platform, "-d", img, "-l"])
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-l"])
         elif op == "-r":
-            rc, out, err = verona(["-p", platform, "-d", img, "-r", "0"])
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", str(slot)])
         elif op == "-w":
-            rc, out, err = verona(["-p", platform, "-d", img, "-w", f"0:{src}"])
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
         elif op == "-b":
-            rc, out, err = verona(["-p", platform, "-d", img, "-b", os.path.join(SCRATCH, f"ctb-{random.randint(0,1<<30)}.img"), "-r", "0"])
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-b", test_path("ctb", ".img"), "-r", str(slot)])
         else:  # -e
-            dummy = os.path.join(SCRATCH, f"ctd-{random.randint(0,1<<30)}.img")
+            dummy = test_path("ctd", ".img")
             gen_random_file(dummy, 1024)
-            rc, out, err = verona(["-p", platform, "-d", img, "-e", dummy])
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-e", dummy])
             cleanup(dummy)
         if rc == 2:
             record("pass", f"edge_corrupted_table platform={platform} kind={kind} op={op}")
         else:
             record("genuine_failure", f"edge_corrupted_table platform={platform} kind={kind} op={op} rc={rc} err={err!r}")
-        cleanup(img, src, os.path.join(SCRATCH, "0.img"))
+        cleanup(img, src, os.path.join(SCRATCH, f"{slot}.img"))
 
 
 def edge_gpt_no_fw_table():
-    img = os.path.join(SCRATCH, f"nofw-{random.randint(0,1<<30)}.img")
+    img = test_path("nofw", ".img")
     subprocess.run(["truncate", "-s", "20000000", img], check=True)
     subprocess.run(["sgdisk", "-Z", img], check=True, capture_output=True)
     subprocess.run(["sgdisk", "-a", "1", "-n", "1:2048:20000", "-c", "1:NOT_FW_TABLE", img], check=True, capture_output=True)
@@ -1057,7 +1215,7 @@ def edge_gpt_no_fw_table():
 
 
 def edge_fw_table_no_signature():
-    img = os.path.join(SCRATCH, f"nosig-{random.randint(0,1<<30)}.img")
+    img = test_path("nosig", ".img")
     subprocess.run(["truncate", "-s", "20000000", img], check=True)
     subprocess.run(["sgdisk", "-Z", img], check=True, capture_output=True)
     subprocess.run(["sgdisk", "-a", "1", "-n", "1:2048:20000", "-c", "1:FW_TABLE", img], check=True, capture_output=True)
@@ -1078,10 +1236,10 @@ def edge_backup_before_failed_write(platform):
     if boundary > MAX_PRACTICAL_BOUNDARY:
         cleanup(img)
         return
-    big = os.path.join(SCRATCH, f"bf-{random.randint(0,1<<30)}.bin")
+    big = test_path("bf", ".bin")
     gen_random_file(big, boundary + 4096)
-    backup = os.path.join(SCRATCH, f"bfb-{random.randint(0,1<<30)}.img")
-    rc, out, err = verona(["-p", platform, "-d", img, "-b", backup, "-w", f"{slot}:{big}"])
+    backup = test_path("bfb", ".img")
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-b", backup, "-w", f"{slot}{sep()}{big}"])
     backup_exists = os.path.exists(backup) and os.path.getsize(backup) > 0
     if rc == 3 and backup_exists:
         record("pass", f"edge_backup_before_failed_write platform={platform}")
@@ -1096,10 +1254,10 @@ def edge_separator_consistency(platform):
     n = fwcount(img_colon, platform)
     slot = random.randint(0, n - 1)
     boundary = duo_boundary(img_colon, slot) if platform == "duo" else monarch_boundary(img_colon, slot)
-    src = os.path.join(SCRATCH, f"sep-{random.randint(0,1<<30)}.bin")
+    src = test_path("sep", ".bin")
     gen_random_file(src, min(4096, max(1, boundary)))
-    rc1, _, err1 = verona(["-p", platform, "-d", img_colon, "-w", f"{slot}:{src}"])
-    rc2, _, err2 = verona(["-p", platform, "-d", img_eq, "-w", f"{slot}={src}"])
+    rc1, _, err1 = verona(["-p", platform_flag(platform), "-d", img_colon, "-w", f"{slot}{sep()}{src}"])
+    rc2, _, err2 = verona(["-p", platform_flag(platform), "-d", img_eq, "-w", f"{slot}={src}"])
     same = sha256(img_colon) == sha256(img_eq)
     if rc1 == 0 and rc2 == 0 and same:
         record("pass", f"edge_separator_consistency platform={platform} slot={slot}")
@@ -1110,8 +1268,10 @@ def edge_separator_consistency(platform):
 
 def edge_backup_twice_same_second(platform):
     img = fresh(platform)
-    rc1, out1, err1 = verona(["-p", platform, "-d", img, "-b", "-r", "0"])
-    rc2, out2, err2 = verona(["-p", platform, "-d", img, "-b", "-r", "0"])
+    n = fwcount(img, platform)
+    slot = random.randint(0, n - 1)
+    rc1, out1, err1 = verona(["-p", platform_flag(platform), "-d", img, "-b", "-r", str(slot)])
+    rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-b", "-r", str(slot)])
     names = sorted(f for f in os.listdir(SCRATCH) if f.startswith(f"verona-table-backup-{platform}-"))
     detail = f"edge_backup_twice_same_second platform={platform} rc1={rc1} rc2={rc2} produced={names}"
     if rc1 == 0 and rc2 == 0:
@@ -1121,16 +1281,18 @@ def edge_backup_twice_same_second(platform):
             record("pass", detail + " (NOTE: same-second default filenames collide -- second backup silently overwrote the first; no data loss observed here since content was identical, but flagging as a real behavior to be aware of)")
     else:
         record("genuine_failure", detail)
-    cleanup(img, os.path.join(SCRATCH, "0.img"), *[os.path.join(SCRATCH, n) for n in names])
+    cleanup(img, os.path.join(SCRATCH, f"{slot}.img"), *[os.path.join(SCRATCH, bn) for bn in names])
 
 
 EDGE_SCENARIOS_PLATFORMED = [
     edge_duplicate_write_direct, edge_duplicate_write_shortcut_collision,
     edge_dry_run_overflow, edge_dry_run_conflict, edge_restore_corrupted,
-    edge_restore_oversized_paddings, edge_garbage_slots, edge_dry_run_alone,
+    edge_restore_oversized_paddings, edge_garbage_slots, edge_out_of_range_slot,
+    edge_dry_run_alone,
     edge_concurrent_write_lock, edge_concurrent_read_shared,
     edge_corrupted_table, edge_backup_before_failed_write,
     edge_separator_consistency, edge_backup_twice_same_second,
+    edge_debug_flag,
 ]
 EDGE_SCENARIOS_NOARG = [edge_help_version_combined, edge_gpt_no_fw_table, edge_fw_table_no_signature]
 

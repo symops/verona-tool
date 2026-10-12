@@ -74,6 +74,7 @@ type args struct {
 	restore string
 
 	dryRun bool
+	debug  bool
 }
 
 // splitSlotSep splits "N:file", "N=file" or bare "N" into slot+file. For -r,
@@ -129,6 +130,8 @@ func parseArgs(argv []string) (*args, error) {
 			a.version = true
 		case "y", "dry-run":
 			a.dryRun = true
+		case "u", "debug":
+			a.debug = true
 		case "l", "list":
 			a.list = true
 		case "p", "platform":

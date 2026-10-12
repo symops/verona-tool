@@ -39,6 +39,7 @@ type plan struct {
 	platform string
 	disk     string
 	dryRun   bool
+	debug    bool
 
 	doBackup   bool
 	backupFile string
@@ -57,7 +58,7 @@ type plan struct {
 }
 
 func buildPlan(a *args) (*plan, error) {
-	p := &plan{platform: a.platform, disk: a.disk, dryRun: a.dryRun}
+	p := &plan{platform: a.platform, disk: a.disk, dryRun: a.dryRun, debug: a.debug}
 
 	if a.platform == "" {
 		return nil, fmt.Errorf("-p/--platform is required")

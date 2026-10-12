@@ -80,6 +80,10 @@ List (-l, --list)
 -y, --dry-run    Print what would be read/written and which checks
                  would pass or fail, without opening the device
                  for writing.
+-u, --debug      Print extra internal diagnostics (table location,
+                 computed boundaries, lock state, byte offsets,
+                 checksums) alongside the normal output. Has no
+                 effect on what is actually done.
 -h, --help       Show this text and exit. Must be used alone.
 -v, --version    Show version and author, then exit. Must be used
                  alone.

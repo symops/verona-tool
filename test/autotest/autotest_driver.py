@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import hashlib
+import traceback
 
 QEMU = ["qemu-aarch64-static", "-L", "/aarch64-sysroot"]
 VERONA = "/opt/tools/verona-tool"
@@ -84,6 +85,13 @@ def test_path(prefix, ext=".bin"):
 
 _DEVICE_NAMES = ["/dev/sdb", "/dev/sdc", "/dev/sdx", "/dev/mmcblk0", "/dev/mmcblk1"]
 _DEVICE_PATH_PROBABILITY = 0.10
+# Device-path names currently in use by a not-yet-cleaned-up image. Without
+# this, two independent fresh() calls in the same scenario (e.g.
+# scenario_single_write's img_a/img_b) could each roll the same device name
+# and silently collide -- the second symlink would repoint over the first,
+# making img_a and img_b the same file despite the scenario's assumption
+# that they're independent copies.
+_ACTIVE_DEVICE_PATHS = set()
 
 
 def maybe_as_device_path(real_path):
@@ -98,12 +106,16 @@ def maybe_as_device_path(real_path):
     byte-level verification."""
     if random.random() >= _DEVICE_PATH_PROBABILITY:
         return real_path
-    name = random.choice(_DEVICE_NAMES)
+    available = [n for n in _DEVICE_NAMES if n not in _ACTIVE_DEVICE_PATHS]
+    if not available:
+        return real_path
+    name = random.choice(available)
     try:
         os.remove(name)
     except OSError:
         pass
     os.symlink(real_path, name)
+    _ACTIVE_DEVICE_PATHS.add(name)
     return name
 
 FW_TYPES = ["Reserved","Bootcode","Kernel","RescueDeviceTree","KernelDeviceTree",
@@ -302,6 +314,7 @@ def cleanup(*paths):
                 os.remove(p)
         except OSError:
             pass
+        _ACTIVE_DEVICE_PATHS.discard(p)
 
 
 def fwcount(img, platform):
@@ -378,12 +391,17 @@ def scenario_single_write(platform):
         return
 
     if platform == "duo":
-        # Symlink /dev/mmcblk0 -> img_b for the real fwtutil.
-        try:
-            os.remove("/dev/mmcblk0")
-        except OSError:
-            pass
-        os.symlink(img_b, "/dev/mmcblk0")
+        # Symlink /dev/mmcblk0 -> img_b for the real fwtutil. img_b may
+        # already BE "/dev/mmcblk0" (fresh()'s own ~10% device-path
+        # coverage, item 7) -- in that case it already points at the
+        # right file, and removing+re-symlinking it onto itself would
+        # create a self-referential loop.
+        if img_b != "/dev/mmcblk0":
+            try:
+                os.remove("/dev/mmcblk0")
+            except OSError:
+                pass
+            os.symlink(img_b, "/dev/mmcblk0")
         # The real fwtutil's CLI is the opposite of what the flag letters
         # suggest: "-x" extracts/reads a slot to FILE, "-r"/"-R" replaces
         # (writes) a slot FROM FILE. Confirmed directly against the real
@@ -820,11 +838,17 @@ _DEVICE_LETTERS = ["/dev/sdb", "/dev/sdc", "/dev/sdx"]
 def scenario_device_letter_independence():
     img = fresh("mch")
     letter = random.choice(_DEVICE_LETTERS)
-    try:
-        os.remove(letter)
-    except OSError:
-        pass
-    os.symlink(img, letter)
+    # img may already BE this exact letter (fresh()'s own ~10%
+    # device-path coverage, item 7) -- in that case it already points at
+    # the right file, and removing+re-symlinking it onto itself would
+    # create a self-referential loop.
+    already_there = img == letter
+    if not already_there:
+        try:
+            os.remove(letter)
+        except OSError:
+            pass
+        os.symlink(img, letter)
     try:
         rc, out, err = verona(["-p", "mch", "-d", letter, "-l"])
         text = out.decode("utf-8", "replace")
@@ -833,10 +857,11 @@ def scenario_device_letter_independence():
         else:
             record("genuine_failure", f"device_letter_independence letter={letter} rc={rc} out={text[:200]!r} err={err!r}")
     finally:
-        try:
-            os.remove(letter)
-        except OSError:
-            pass
+        if not already_there:
+            try:
+                os.remove(letter)
+            except OSError:
+                pass
     cleanup(img)
 
 
@@ -1337,8 +1362,9 @@ def main():
                 scenario = random.choice(SCENARIOS_DUO if platform == "duo" else SCENARIOS_MCH)
                 scenario(platform)
         except Exception as e:
+            tb = traceback.format_exc()
             record("genuine_failure", f"EXCEPTION on iteration {i} (mode={mode}): {e!r}")
-            log(f"EXCEPTION: {e!r}")
+            log(f"EXCEPTION: {e!r}\n{tb}")
         if i % 10 == 0:
             log(f"iteration {i}: {json.dumps(counters)}")
     log(f"autotest finished after {i} iterations: {json.dumps(counters)}")

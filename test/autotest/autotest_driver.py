@@ -403,11 +403,14 @@ def scenario_single_write(platform):
                 pass
             os.symlink(img_b, "/dev/mmcblk0")
         # The real fwtutil's CLI is the opposite of what the flag letters
-        # suggest: "-x" extracts/reads a slot to FILE, "-r"/"-R" replaces
-        # (writes) a slot FROM FILE. Confirmed directly against the real
-        # binary's own output ("Извлечение раздела..." for -x vs.
-        # "Замена раздела..." for -r).
-        rc2, out2, err2 = fwtutil(["-x", f"{slot}:{src}"])
+        # suggest: "-r"/"-R" replaces (writes) a slot FROM FILE, "-x"
+        # extracts (reads) a slot TO FILE. Confirmed directly against the
+        # real binary's own output ("Замена раздела..." for -r vs.
+        # "Извлечение раздела..." for -x). We want a WRITE here: apply the
+        # same src content to img_b via the real tool, so img_a (written
+        # by verona-tool) and img_b (written by fwtutil) can be compared
+        # whole-image and expected byte-identical below.
+        rc2, out2, err2 = fwtutil(["-r", f"{slot}:{src}"])
         if rc2 != 0:
             record("genuine_failure", f"single_write duo slot={slot} size={size} fwtutil rc={rc2} err={err2!r}")
             cleanup(img_a, img_b, src)

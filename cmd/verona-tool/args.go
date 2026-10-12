@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const version = "0.1.0"
+const version = "1.0"
 
 // slotFile is one -r/-w SLOT[:FILE] or SLOT=FILE argument.
 type slotFile struct {

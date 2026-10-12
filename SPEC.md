@@ -73,6 +73,13 @@ is no padding/zero-fill feature at all; a write places exactly
   would overestimate the boundary for slots followed by a partition
   with no table entry (empirically proven: this would overestimate
   uBoot's true 1MB boundary as 3MB, and RescueAudio's true 4MB as 5MB).
+  A slot's table-recorded Offset must match a real GPT partition's
+  StartingLBA exactly -- if the GPT partition that used to back a slot
+  was deleted (table left stale) or the table otherwise disagrees with
+  the live GPT, there is no partition starting there at all, and this
+  is refused (exit 2) rather than silently falling through to whatever
+  partition happens to come next on the disk, which could produce a
+  much larger, wrong boundary.
 - **Duo**: sort all fw-table entries by Offset, boundary = next
   entry's Offset minus this entry's Offset. If last by offset,
   boundary = size of `-d`. **Known, accepted limitation**: Duo has no

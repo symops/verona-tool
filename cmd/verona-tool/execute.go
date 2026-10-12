@@ -118,16 +118,27 @@ func execute(p *plan) int {
 	}
 	overflowed := false
 	for _, w := range p.writes {
+		if w.slot < 0 || w.slot >= len(dev.Table.Fws) {
+			fmt.Fprintf(os.Stderr, "error: slot %d out of range (table has %d entries)\n", w.slot, len(dev.Table.Fws))
+			return exitSlotRange
+		}
 		b, err := dev.Boundary(w.slot)
 		dbg(p.debug, "slot %d: computed boundary %d bytes, file size %d bytes", w.slot, b, fileSizes[w.slot])
 		if err != nil {
+			// The slot number itself is valid (checked above) -- any
+			// error from here on is a table/GPT consistency problem,
+			// e.g. Monarch's recorded Offset no longer matches the
+			// start of any real GPT partition (its backing partition
+			// was deleted or the table is stale), not a bad slot
+			// number, so it's bucketed with table corruption rather
+			// than exitSlotRange.
 			if p.dryRun {
 				fmt.Fprintln(os.Stderr, "would fail:", err)
 				overflowed = true
 				continue
 			}
 			fmt.Fprintln(os.Stderr, "error:", err)
-			return exitSlotRange
+			return exitTableInvalid
 		}
 		if uint64(fileSizes[w.slot]) > b {
 			msg := fmt.Sprintf("refusing: file for slot %d is %d bytes, exceeds destination boundary of %d bytes", w.slot, fileSizes[w.slot], b)
@@ -185,6 +196,11 @@ func doRead(dev *verona.Device, r readOp, dryRun, debug bool) int {
 	}
 	dbg(debug, "read %d bytes from offset 0x%08x", len(buf), fw.Offset)
 	if err := os.WriteFile(r.file, buf, 0644); err != nil {
+		// os.WriteFile leaves whatever was already written on disk (e.g.
+		// a destination filesystem that ran out of space partway
+		// through) -- remove it so a failed read never leaves behind a
+		// file that looks complete but silently holds truncated data.
+		os.Remove(r.file)
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitArgs
 	}
@@ -275,6 +291,9 @@ func doBackup(dev *verona.Device, file string, dryRun, debug bool) int {
 		return exitTableInvalid
 	}
 	if err := os.WriteFile(file, raw, 0644); err != nil {
+		// Same reasoning as doRead: don't leave a truncated backup file
+		// behind on a failed write (e.g. destination out of space).
+		os.Remove(file)
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitArgs
 	}

@@ -11,6 +11,7 @@ import sys
 import time
 import hashlib
 import traceback
+import signal
 
 QEMU = ["qemu-aarch64-static", "-L", "/aarch64-sysroot"]
 VERONA = "/opt/tools/verona-tool"
@@ -1447,6 +1448,68 @@ def edge_fw_table_no_signature():
     cleanup(img)
 
 
+def edge_mch_deleted_partition_boundary():
+    """A Monarch firmware slot's table-recorded Offset must correspond to
+    a real GPT partition's own StartingLBA. If that backing partition
+    was deleted (or the table otherwise disagrees with the live GPT),
+    verona-tool must refuse (exit 2) rather than silently falling
+    through to whatever partition happens to come next on the disk --
+    which could produce a much larger, wrong write boundary. Deletes one
+    partition entry directly in the GPT array (zeroing its type GUID,
+    exactly what marks an entry as unused/deleted) while leaving the
+    VERONA table's own Offset for that slot completely untouched."""
+    img = fresh("mch")
+    n = fwcount(img, "mch")
+    candidates = writable_slots(img, "mch", n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, _ = random.choice(candidates)
+    table_off, _, _ = monarch_table_offset(img)
+    h = read_header(img, table_off)
+    fws = read_fw_entries(img, table_off, h["plen"], h["flen"])
+    start_lba = fws[slot]["offset"] // 512
+
+    with open(img, "rb") as f:
+        f.seek(512)
+        hdr = f.read(512)
+        part_lba = struct.unpack_from("<Q", hdr, 72)[0]
+        num = struct.unpack_from("<I", hdr, 80)[0]
+        esize = struct.unpack_from("<I", hdr, 84)[0]
+
+    deleted = False
+    with open(img, "r+b") as f:
+        for i in range(num):
+            entry_off = part_lba * 512 + i * esize
+            f.seek(entry_off)
+            e = f.read(esize)
+            if e[0:16] == b"\x00" * 16:
+                continue
+            s = struct.unpack_from("<Q", e, 32)[0]
+            if s == start_lba:
+                f.seek(entry_off)
+                f.write(b"\x00" * 16)  # zero the type GUID -> "deleted"
+                deleted = True
+                break
+
+    if not deleted:
+        record("genuine_failure", f"edge_mch_deleted_partition_boundary: could not find/delete the GPT partition backing slot {slot} (start_lba={start_lba})")
+        cleanup(img)
+        return
+
+    src = test_path("delpart", ".bin")
+    gen_random_file(src, 32)
+    before = sha256(img)
+    rc, out, err = verona(["-p", "mch", "-d", img, "-w", f"{slot}:{src}"])
+    after = sha256(img)
+    errtext = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+    if rc == 2 and "no gpt partition" in errtext.lower() and before == after:
+        record("pass", f"edge_mch_deleted_partition_boundary slot={slot}")
+    else:
+        record("genuine_failure", f"edge_mch_deleted_partition_boundary slot={slot} rc={rc} unchanged={before==after} err={errtext!r}")
+    cleanup(img, src)
+
+
 def edge_backup_before_failed_write(platform):
     img = fresh(platform)
     n = fwcount(img, platform)
@@ -1515,6 +1578,372 @@ SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario
                  edge_out_of_range_slot]
 
 
+def edge_arg_fuzzing(platform):
+    """Malformed-input robustness: an absurdly huge slot number, an
+    empty value where one is required, a near-NAME_MAX-length file
+    path, a flag repeated many times in one command, and an unknown
+    flag -- all must be rejected cleanly (exit 1), never hang or
+    crash."""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != 1:
+            record("genuine_failure", f"edge_arg_fuzzing[{label}] platform={platform} rc={rc} err={err!r}")
+            ok = False
+
+    check("huge_slot", ["-p", platform_flag(platform), "-d", img, "-r", "999999999999999999999999"])
+    check("empty_value", ["-p", platform_flag(platform), "-d", img, "-w", "5:"])
+    long_name = "x" * 4000 + ".bin"
+    check("long_path", ["-p", platform_flag(platform), "-d", img, "-r", f"0:{os.path.join(SCRATCH, long_name)}"])
+    check("repeated_flag", ["-p", platform_flag(platform), "-d", img] + ["-l"] * 50 + ["-r", "0"])
+    check("unknown_flag", ["-p", platform_flag(platform), "-d", img, "--bogus-flag"])
+
+    if ok:
+        record("pass", f"edge_arg_fuzzing platform={platform}")
+    cleanup(img, os.path.join(os.getcwd(), "0.img"))
+
+
+def edge_kill_mid_write_lock_release(platform):
+    """Kill verona-tool (SIGKILL or SIGTERM) partway through a -w and
+    confirm the flock on the device is released when the process dies,
+    so a subsequent invocation does not hang waiting on a stale lock.
+    flock is tied to the process's file descriptor table and is always
+    released on process death regardless of how it died, so this is
+    really confirming verona-tool uses real flock() and not some
+    separate lockfile scheme that could outlive the process."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, boundary = random.choice(candidates)
+    size = min(boundary, 16 * 1024 * 1024)
+    src = test_path("kill", ".bin")
+    gen_random_file(src, size)
+
+    args = ["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"]
+    log_cmd("verona-tool", args + ["# killed mid-write"])
+    proc = subprocess.Popen(QEMU + [VERONA] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(random.uniform(0.05, 0.2))
+    sig = random.choice([signal.SIGKILL, signal.SIGTERM])
+    try:
+        proc.send_signal(sig)
+    except ProcessLookupError:
+        pass  # it finished before we could signal it -- nothing to test this time
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=15)
+
+    t0 = time.time()
+    rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-l"])
+    elapsed = time.time() - t0
+    if rc2 == 0 and elapsed < 10:
+        record("pass", f"edge_kill_mid_write_lock_release platform={platform} slot={slot} sig={sig.name} elapsed={elapsed:.2f}s")
+    else:
+        record("genuine_failure", f"edge_kill_mid_write_lock_release platform={platform} slot={slot} sig={sig.name} rc2={rc2} elapsed={elapsed:.2f}s err={err2!r}")
+    cleanup(img, src)
+
+
+def edge_debug_and_dryrun_combined(platform):
+    """-D and -n together in one invocation: debug output must describe
+    the dry-run plan correctly, with no crash or malformed output, and
+    the device must end up completely unchanged (it's still a dry run)."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, boundary = random.choice(candidates)
+    src = test_path("dn", ".bin")
+    gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
+    before = sha256(img)
+    flag_d = random.choice(["-D", "--debug"])
+    flag_n = random.choice(["-n", "--dry-run"])
+    rc, outb, err = verona(["-p", platform_flag(platform), "-d", img, flag_d, flag_n, "-w", f"{slot}{sep()}{src}"])
+    out = outb.decode("utf-8", "replace")
+    after = sha256(img)
+    ok = True
+    if rc != 0:
+        record("genuine_failure", f"edge_debug_and_dryrun_combined platform={platform} slot={slot} rc={rc} err={err!r}")
+        ok = False
+    if "[debug]" not in out:
+        record("genuine_failure", f"edge_debug_and_dryrun_combined platform={platform} slot={slot}: no [debug] output with -D -n combined")
+        ok = False
+    if "would write" not in out:
+        record("genuine_failure", f"edge_debug_and_dryrun_combined platform={platform} slot={slot}: no dry-run plan ('would write') in output")
+        ok = False
+    if before != after:
+        record("genuine_failure", f"edge_debug_and_dryrun_combined platform={platform} slot={slot}: device changed despite -n")
+        ok = False
+    if ok:
+        record("pass", f"edge_debug_and_dryrun_combined platform={platform} slot={slot}")
+    cleanup(img, src)
+
+
+def edge_idempotent_rewrite(platform):
+    """Writing the exact same content to the same slot twice in a row
+    must succeed cleanly both times (checksum recompute is idempotent,
+    no spurious 'already written'/stale-state error), and a subsequent
+    read must match."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, boundary = random.choice(candidates)
+    src = test_path("idem", ".bin")
+    gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
+    rc1, out1, err1 = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
+    rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
+    if rc1 != 0 or rc2 != 0:
+        record("genuine_failure", f"edge_idempotent_rewrite platform={platform} slot={slot} rc1={rc1} rc2={rc2} err1={err1!r} err2={err2!r}")
+        cleanup(img, src)
+        return
+    if not verify_payload(img, platform, slot, src, f"edge_idempotent_rewrite platform={platform} slot={slot}"):
+        cleanup(img, src)
+        return
+    readback = test_path("idemr", ".bin")
+    rc3, out3, err3 = verona(["-p", platform_flag(platform), "-d", img, "-r", f"{slot}{sep()}{readback}"])
+    ok = True
+    if rc3 != 0:
+        record("genuine_failure", f"edge_idempotent_rewrite readback platform={platform} slot={slot} rc3={rc3} err={err3!r}")
+        ok = False
+    else:
+        with open(src, "rb") as f1, open(readback, "rb") as f2:
+            same = f1.read() == f2.read()
+        if not same:
+            record("genuine_failure", f"edge_idempotent_rewrite platform={platform} slot={slot}: readback mismatch after double write")
+            ok = False
+    if ok:
+        record("pass", f"edge_idempotent_rewrite platform={platform} slot={slot}")
+    cleanup(img, src, readback)
+
+
+def edge_list_empty_entries(platform):
+    """-l on a table with a mix of empty (length=0, the real uBoot-style
+    empty-slot pattern) and populated entries must format every line
+    correctly -- no crash, no garbled numbers -- for both kinds in the
+    same listing."""
+    img = fresh(platform)
+    rc, outb, err = verona(["-p", platform_flag(platform), "-d", img, "-l"])
+    out = outb.decode("utf-8", "replace")
+    if rc != 0:
+        record("genuine_failure", f"edge_list_empty_entries platform={platform} rc={rc} err={err!r}")
+        cleanup(img)
+        return
+    matches = _FW_RE.findall(out)
+    empty = [m for m in matches if m[7] == "0"]
+    populated = [m for m in matches if m[7] != "0"]
+    if empty and populated:
+        record("pass", f"edge_list_empty_entries platform={platform} empty={len(empty)} populated={len(populated)}")
+    elif not empty:
+        record("expected_divergence", f"edge_list_empty_entries platform={platform}: golden image has no empty (length=0) entries to exercise -- not a verona-tool issue")
+    else:
+        record("genuine_failure", f"edge_list_empty_entries platform={platform}: no populated entries parsed alongside the empty one(s)")
+    cleanup(img)
+
+
+def edge_same_path_read_then_write(platform):
+    """The same file path used as a -r output in one invocation and then
+    as a -w source LATER IN THE SAME invocation (-r 5:data.bin -w
+    7:data.bin) -- confirms the read fully completes and closes before
+    the write reopens that same path as its source, with the correct
+    resulting content in the write's target slot."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    read_slot = write_slot = None
+    for rs, _ in candidates:
+        _, _, rlen = read_slot_payload(img, platform, rs)
+        for ws, wb in candidates:
+            if ws != rs and rlen <= wb:
+                read_slot, write_slot = rs, ws
+                break
+        if read_slot is not None:
+            break
+    if read_slot is None:
+        cleanup(img)
+        return
+    shared = test_path("shared", ".bin")
+
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img,
+                            "-r", f"{read_slot}{sep()}{shared}",
+                            "-w", f"{write_slot}{sep()}{shared}"])
+    if rc != 0:
+        record("genuine_failure", f"edge_same_path_read_then_write platform={platform} read_slot={read_slot} write_slot={write_slot} rc={rc} err={err!r}")
+        cleanup(img, shared)
+        return
+
+    read_payload, _, _ = read_slot_payload(img, platform, read_slot)
+    if not verify_payload(img, platform, write_slot, shared, f"edge_same_path_read_then_write platform={platform} write_slot={write_slot}"):
+        cleanup(img, shared)
+        return
+    with open(shared, "rb") as f:
+        shared_bytes = f.read()
+    if read_payload == shared_bytes:
+        record("pass", f"edge_same_path_read_then_write platform={platform} read_slot={read_slot} write_slot={write_slot}")
+    else:
+        record("genuine_failure", f"edge_same_path_read_then_write platform={platform} read_slot={read_slot} write_slot={write_slot}: shared file does not match read_slot's original payload")
+    cleanup(img, shared)
+
+
+_PLATFORM_ALIASES_DOC = {
+    "mch": ["m", "monarch", "mch", "home"],
+    "duo": ["p", "pelican", "mchd", "duo"],
+}
+
+
+def edge_doc_platform_aliases():
+    """Every platform alias documented in --help's text must actually be
+    accepted by the real binary -- not just the canonical duo/mch forms,
+    and not just whatever platform_flag() happens to roll elsewhere.
+    Guards doc/behavior drift. 'auto' is exercised thoroughly elsewhere
+    (scenario_auto_detect, platform_flag()'s regular inclusion of it) and
+    isn't a simple "accepted" check the same way, so it's not repeated
+    here."""
+    ok = True
+    for canonical, aliases in _PLATFORM_ALIASES_DOC.items():
+        img = fresh(canonical)
+        for alias in aliases:
+            rc, out, err = verona(["-p", alias, "-d", img, "-l"])
+            if rc != 0:
+                record("genuine_failure", f"edge_doc_platform_aliases alias={alias!r} canonical={canonical} rc={rc} err={err!r}")
+                ok = False
+        cleanup(img)
+    if ok:
+        record("pass", "edge_doc_platform_aliases")
+
+
+def edge_doc_exit_codes():
+    """Every exit code documented in help.go/SPEC.md must actually be
+    produced by its corresponding real scenario -- guards doc/behavior
+    drift. Exit 6 (post-write verification mismatch) is intentionally
+    not included: it can only occur from an internal race between
+    verona-tool's own write and its own immediate readback, which can't
+    be triggered from outside the process without instrumentation."""
+    ok = True
+
+    def check(label, expect, rc, err=None):
+        nonlocal ok
+        if rc != expect:
+            record("genuine_failure", f"edge_doc_exit_codes[{label}] expected exit {expect}, got {rc} err={err!r}")
+            ok = False
+
+    platform = random.choice(["duo", "mch"])
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+
+    rc, _, _ = verona(["-p", platform_flag(platform), "-d", img, "-l"])
+    check("0_success", 0, rc)
+
+    rc, _, err = verona(["-p", platform_flag(platform), "-d", img, "--bogus-flag"])
+    check("1_usage_error", 1, rc, err)
+
+    img2 = fresh(platform)
+    off2 = DUO_TABLE_OFFSET if platform == "duo" else monarch_table_offset(img2)[0]
+    with open(img2, "r+b") as f:
+        f.seek(off2)
+        f.write(b"NOTAREAL")
+    rc, _, err = verona(["-p", platform_flag(platform), "-d", img2, "-l"])
+    check("2_corrupted_table", 2, rc, err)
+    cleanup(img2)
+
+    src3 = None
+    if candidates:
+        slot3, boundary3 = random.choice(candidates)
+        src3 = test_path("doc3", ".bin")
+        gen_random_file(src3, boundary3 + 4096)
+        rc, _, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot3}{sep()}{src3}"])
+        check("3_overflow_refused", 3, rc, err)
+
+    rc, _, err = verona(["-p", platform_flag(platform), "-d", img, "-r", str(n + 50)])
+    check("4_slot_out_of_range", 4, rc, err)
+
+    src5 = None
+    if candidates:
+        slot5 = candidates[0][0]
+        src5 = test_path("doc5", ".bin")
+        gen_random_file(src5, 16)
+        rc, _, err = verona(["-p", platform_flag(platform), "-d", img,
+                              "-w", f"{slot5}{sep()}{src5}", "-w", f"{slot5}{sep()}{src5}"])
+        check("5_conflict", 5, rc, err)
+
+    src7 = None
+    fd = os.open(img, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if candidates:
+            slot7 = candidates[0][0]
+            src7 = test_path("doc7", ".bin")
+            gen_random_file(src7, 16)
+            rc, _, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot7}{sep()}{src7}"])
+            check("7_locked", 7, rc, err)
+    finally:
+        os.close(fd)
+
+    if ok:
+        record("pass", f"edge_doc_exit_codes platform={platform}")
+    cleanup(img, src3, src5, src7)
+
+
+_TMPFS_DIR = "/mnt/verona-tinyfs"
+
+
+def edge_disk_full_read_output():
+    """-r's output path on a deliberately tiny, size-limited filesystem
+    (too small for the slot being read) must fail cleanly with a clear
+    I/O error -- no crash, no corrupt partial file left behind. Skips
+    itself (expected_divergence, not a verona-tool issue) if this
+    container can't mount tmpfs at all (missing CAP_SYS_ADMIN)."""
+    platform = random.choice(["duo", "mch"])
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = [s for s, _ in writable_slots(img, platform, n)]
+    biggest, biggest_len = None, -1
+    for s in candidates:
+        _, _, length = read_slot_payload(img, platform, s)
+        if length > biggest_len:
+            biggest, biggest_len = s, length
+    if biggest is None or biggest_len < 8192:
+        cleanup(img)
+        return
+
+    os.makedirs(_TMPFS_DIR, exist_ok=True)
+    mounted = subprocess.run(["mount", "-t", "tmpfs", "-o", "size=4k", "tmpfs", _TMPFS_DIR],
+                              capture_output=True)
+    if mounted.returncode != 0:
+        record("expected_divergence",
+               f"edge_disk_full_read_output: tmpfs mount unavailable in this container "
+               f"({mounted.stderr.decode('utf-8', 'replace').strip()}) -- skipping, not a verona-tool issue")
+        cleanup(img)
+        return
+    try:
+        out_path = os.path.join(_TMPFS_DIR, "full.img")
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", f"{biggest}{sep()}{out_path}"])
+        if rc == 0:
+            record("genuine_failure", f"edge_disk_full_read_output platform={platform} slot={biggest}: succeeded despite insufficient space on the destination filesystem")
+        elif rc < 0 or rc in (124, 134, 136, 137, 139):
+            record("genuine_failure", f"edge_disk_full_read_output platform={platform} slot={biggest}: crashed/hung instead of a clean error (rc={rc})")
+        else:
+            partial = os.path.exists(out_path) and os.path.getsize(out_path) not in (0,)
+            if partial:
+                record("genuine_failure", f"edge_disk_full_read_output platform={platform} slot={biggest}: left a nonzero partial file behind (rc={rc})")
+            else:
+                record("pass", f"edge_disk_full_read_output platform={platform} slot={biggest} rc={rc} err={err!r}")
+    finally:
+        subprocess.run(["umount", _TMPFS_DIR], capture_output=True)
+    cleanup(img)
+
+
 EDGE_SCENARIOS_PLATFORMED = [
     edge_duplicate_write_direct, edge_duplicate_write_shortcut_collision,
     edge_dry_run_overflow, edge_dry_run_conflict, edge_restore_corrupted,
@@ -1524,8 +1953,12 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_corrupted_table, edge_backup_before_failed_write,
     edge_separator_consistency, edge_backup_twice_same_second,
     edge_debug_flag,
+    edge_arg_fuzzing, edge_kill_mid_write_lock_release, edge_debug_and_dryrun_combined,
+    edge_idempotent_rewrite, edge_list_empty_entries, edge_same_path_read_then_write,
 ]
-EDGE_SCENARIOS_NOARG = [edge_help_version_combined, edge_gpt_no_fw_table, edge_fw_table_no_signature]
+EDGE_SCENARIOS_NOARG = [edge_help_version_combined, edge_gpt_no_fw_table, edge_fw_table_no_signature,
+                         edge_doc_platform_aliases, edge_doc_exit_codes, edge_disk_full_read_output,
+                         edge_mch_deleted_partition_boundary]
 
 
 def run_one_edge_iteration():

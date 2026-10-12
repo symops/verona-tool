@@ -286,6 +286,22 @@ def monarch_boundary(img, slot):
     return (total - 33) * 512 - off
 
 
+def writable_slots(img, platform, n):
+    """All slot indices whose write boundary falls in the practically
+    testable range [16, MAX_PRACTICAL_BOUNDARY]. Scenarios that pick ONE
+    random slot and then bail if its boundary disqualifies it waste that
+    iteration and skew write coverage towards whichever slots happen to
+    both get picked AND pass the filter -- picking from this list instead
+    gives -w the same full-range coverage -r already gets (which has no
+    such filter, since reading has no boundary to violate)."""
+    result = []
+    for slot in range(n):
+        b = duo_boundary(img, slot) if platform == "duo" else monarch_boundary(img, slot)
+        if 16 <= b <= MAX_PRACTICAL_BOUNDARY:
+            result.append((slot, b))
+    return result
+
+
 def fresh(platform):
     """A fresh scratch copy of the platform's golden image. ~10% of the
     time, returns a /dev/sdX- or /dev/mmcblkN-style symlink pointing at
@@ -360,11 +376,11 @@ def scenario_single_write(platform):
     img_a = fresh(platform)
     img_b = fresh(platform)
     n = fwcount(img_a, platform)
-    slot = random.randint(0, n - 1)
-    boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
-    if boundary < 16 or boundary > MAX_PRACTICAL_BOUNDARY:
+    candidates = writable_slots(img_a, platform, n)
+    if not candidates:
         cleanup(img_a, img_b)
         return
+    slot, boundary = random.choice(candidates)
     size_choice = random.choice(["small", "near", "aligned512"])
     if size_choice == "small":
         size = random.randint(1, min(4096, boundary))
@@ -496,11 +512,11 @@ def classify_monarch_diffs(diffs, context, plen, flen):
 def scenario_sequential_overwrites(platform):
     img_a = fresh(platform)
     n = fwcount(img_a, platform)
-    slot = random.randint(0, n - 1)
-    boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
-    if boundary < 16 or boundary > MAX_PRACTICAL_BOUNDARY:
+    candidates = writable_slots(img_a, platform, n)
+    if not candidates:
         cleanup(img_a)
         return
+    slot, boundary = random.choice(candidates)
     rounds = random.choice([2, 3])
     srcs = []
     ok = True
@@ -583,9 +599,9 @@ def scenario_backup_restore_list(platform):
         cleanup(img_a, backup_file, os.path.join(os.getcwd(), f"{read_slot}.img"))
         return
 
-    slot = random.randint(0, n - 1)
-    boundary = duo_boundary(img_a, slot) if platform == "duo" else monarch_boundary(img_a, slot)
-    if boundary >= 16:
+    mutate_candidates = writable_slots(img_a, platform, n)
+    if mutate_candidates:
+        slot, boundary = random.choice(mutate_candidates)
         src = test_path("mut", ".bin")
         gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
         rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-w", f"{slot}{sep()}{src}"])
@@ -611,6 +627,171 @@ def scenario_backup_restore_list(platform):
         os.remove(os.path.join(os.getcwd(), f"{read_slot}.img"))
     except OSError:
         pass
+
+
+def scenario_multi_read(platform):
+    """Several -r SLOT:FILE in a single invocation -- exercises multi-flag
+    parsing (not just one -r per call, which is all every other scenario
+    does) and the 'all -r run before any -w' ordering guarantee, by also
+    throwing in a -w for a slot NOT among the ones being read and
+    confirming every -r output still matches its slot's real payload
+    regardless of where the -w fell in the argument list."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    if n < 3:
+        cleanup(img)
+        return
+    read_slots = random.sample(range(n), k=min(4, n))
+    args = ["-p", platform_flag(platform), "-d", img]
+    outs = {}
+    for s in read_slots:
+        outs[s] = test_path(f"mr{s}", ".img")
+        args += ["-r", f"{s}{sep()}{outs[s]}"]
+
+    write_slot = None
+    write_src = None
+    candidates = writable_slots(img, platform, n)
+    candidates = [(s, b) for s, b in candidates if s not in read_slots]
+    if candidates and random.random() < 0.5:
+        write_slot, boundary = random.choice(candidates)
+        write_src = test_path("mrw", ".bin")
+        gen_random_file(write_src, random.randint(1, min(boundary, 1 << 16)))
+        args += ["-w", f"{write_slot}{sep()}{write_src}"]
+
+    rc, out, err = verona(args)
+    if rc != 0:
+        record("genuine_failure", f"multi_read platform={platform} slots={read_slots} write_slot={write_slot} rc={rc} err={err!r}")
+        cleanup(img, write_src, *outs.values())
+        return
+
+    ok = True
+    for s in read_slots:
+        if not verify_payload(img, platform, s, outs[s], f"multi_read platform={platform} slots={read_slots} slot={s}"):
+            ok = False
+    if write_slot is not None and not verify_payload(img, platform, write_slot, write_src, f"multi_read platform={platform} write_slot={write_slot}"):
+        ok = False
+    if ok:
+        record("pass", f"multi_read platform={platform} slots={read_slots} write_slot={write_slot}")
+    cleanup(img, write_src, *outs.values())
+
+
+def scenario_duo_fwtutil_crosscheck(platform):
+    """Dedicated, frequent cross-validation against the real fwtutil for
+    Duo, covering BOTH directions: write via verona-tool then
+    independently read it back via fwtutil's own -x (extract) and compare
+    bytes; then separately write via fwtutil's own -r (replace) and
+    independently read it back via verona-tool's -r, also compared.
+    scenario_single_write already does one fwtutil write-comparison per
+    run at most; this scenario exists purely to make fwtutil exercise a
+    meaningfully larger fraction of Duo iterations, across both of its
+    directions, not just a single incidental use."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, boundary = random.choice(candidates)
+    size = random.randint(1, min(boundary, 1 << 16))
+
+    if img != "/dev/mmcblk0":
+        try:
+            os.remove("/dev/mmcblk0")
+        except OSError:
+            pass
+        os.symlink(img, "/dev/mmcblk0")
+
+    direction = random.choice(["verona_write_fwtutil_read", "fwtutil_write_verona_read"])
+    src = test_path("fwx", ".bin")
+    gen_random_file(src, size)
+    if direction == "verona_write_fwtutil_read":
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
+        if rc != 0:
+            record("genuine_failure", f"duo_fwtutil_crosscheck write(verona) platform={platform} slot={slot} rc={rc} err={err!r}")
+            cleanup(img, src)
+            return
+        readback = test_path("fwxr", ".bin")
+        rc2, out2, err2 = fwtutil(["-x", f"{slot}:{readback}"])
+        if rc2 != 0:
+            record("genuine_failure", f"duo_fwtutil_crosscheck read(fwtutil) platform={platform} slot={slot} rc={rc2} err={err2!r}")
+            cleanup(img, src, readback)
+            return
+        with open(src, "rb") as f1, open(readback, "rb") as f2:
+            same = f1.read() == f2.read()
+        cleanup(readback)
+    else:
+        rc, out, err = fwtutil(["-r", f"{slot}:{src}"])
+        if rc != 0:
+            record("genuine_failure", f"duo_fwtutil_crosscheck write(fwtutil) platform={platform} slot={slot} rc={rc} err={err!r}")
+            cleanup(img, src)
+            return
+        readback = test_path("fwxr", ".bin")
+        rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-r", f"{slot}{sep()}{readback}"])
+        if rc2 != 0:
+            record("genuine_failure", f"duo_fwtutil_crosscheck read(verona) platform={platform} slot={slot} rc={rc2} err={err2!r}")
+            cleanup(img, src, readback)
+            return
+        with open(src, "rb") as f1, open(readback, "rb") as f2:
+            same = f1.read() == f2.read()
+        cleanup(readback)
+
+    if same:
+        record("pass", f"duo_fwtutil_crosscheck platform={platform} slot={slot} direction={direction}")
+    else:
+        record("genuine_failure", f"duo_fwtutil_crosscheck mismatch platform={platform} slot={slot} direction={direction}")
+    cleanup(img, src)
+
+
+def scenario_mch_fwtablectl_crosscheck(platform):
+    """Dedicated, frequent cross-validation against the real fwtablectl
+    for Monarch: write via verona-tool on img_a, apply the identical
+    update via fwtablectl's own 'firmware update' on an independently
+    extracted copy of img_b's table region, and compare the two
+    resulting table regions byte-for-byte. fwtablectl has no read/extract
+    command of its own (checked directly against the real binary's
+    usage text), so unlike the Duo/fwtutil check this is write-only --
+    scenario_single_write already does this once per run at most; this
+    scenario exists purely to make fwtablectl exercise a meaningfully
+    larger fraction of Monarch iterations instead of being nearly absent
+    from any given run."""
+    img_a = fresh(platform)
+    img_b = fresh(platform)
+    n = fwcount(img_a, platform)
+    candidates = writable_slots(img_a, platform, n)
+    if not candidates:
+        cleanup(img_a, img_b)
+        return
+    slot, boundary = random.choice(candidates)
+    size = random.randint(1, min(boundary, 1 << 16))
+    src = test_path("ftc", ".bin")
+    gen_random_file(src, size)
+
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img_a, "-w", f"{slot}{sep()}{src}"])
+    if rc != 0:
+        record("genuine_failure", f"mch_fwtablectl_crosscheck write(verona) platform={platform} slot={slot} rc={rc} err={err!r}")
+        cleanup(img_a, img_b, src)
+        return
+
+    off_a, _, _ = monarch_table_offset(img_a)
+    h_a = read_header(img_a, off_a)
+    table_a = open(img_a, "rb").read()[off_a:off_a + 32 + h_a["plen"] + h_a["flen"]]
+
+    off_b, _, _ = monarch_table_offset(img_b)
+    h_b = read_header(img_b, off_b)
+    table_file = test_path("ftctbl", ".img")
+    with open(table_file, "wb") as f:
+        f.write(open(img_b, "rb").read()[off_b:off_b + 32 + h_b["plen"] + h_b["flen"]])
+    type_name = FW_TYPES[read_fw_entries(img_b, off_b, h_b["plen"], h_b["flen"])[slot]["type"]]
+    rc2, out2, err2 = fwtablectl(["firmware", "update", table_file, type_name, src])
+    if rc2 != 0:
+        record("genuine_failure", f"mch_fwtablectl_crosscheck write(fwtablectl) platform={platform} slot={slot} rc={rc2} err={err2!r}")
+        cleanup(img_a, img_b, src, table_file)
+        return
+    table_b = open(table_file, "rb").read()
+
+    diffs = diff_monarch_tables(table_a, table_b, h_a)
+    classify_monarch_diffs(diffs, f"mch_fwtablectl_crosscheck slot={slot} size={size}", h_a["plen"], h_a["flen"])
+    cleanup(img_a, img_b, src, table_file)
 
 
 import re
@@ -868,14 +1049,6 @@ def scenario_device_letter_independence():
     cleanup(img)
 
 
-SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
-                 scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
-                 scenario_shortcut_write, scenario_auto_detect]
-SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
-                 scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
-                 scenario_shortcut_write, scenario_auto_detect]
-
-
 # =============================================================== edge cases
 # Deterministic, mostly-fast edge/conflict/refusal checks, distinct from the
 # randomized fuzzing scenarios above. See the coordinator's 16-point list.
@@ -1082,13 +1255,20 @@ def edge_out_of_range_slot(platform):
     simply past the end of the real table (fwcount + a small offset) must
     be refused with the specific 'slot index out of range' error (exit 4)
     -- distinct from edge_garbage_slots's negative/non-numeric/absurd
-    inputs, which are rejected earlier as plain exit-1 argument errors."""
+    inputs, which are rejected earlier as plain exit-1 argument errors.
+    Also confirms the refused -w left the device completely untouched
+    (whole-image hash unchanged), not just that it returned the right
+    exit code. Registered in both the dedicated edge-scenario list AND
+    the regular per-platform rotation, so out-of-range attempts recur
+    throughout a run at a noticeable but not overwhelming frequency,
+    rather than only in a single one-off edge pass."""
     img = fresh(platform)
     n = fwcount(img, platform)
     slot = n + random.randint(1, 500)
     src = test_path("oor", ".bin")
     gen_random_file(src, 32)
     ok = True
+    before = sha256(img)
     rc_r, out_r, err_r = verona(["-p", platform_flag(platform), "-d", img, "-r", str(slot)])
     if rc_r != 4:
         record("genuine_failure", f"edge_out_of_range_slot platform={platform} slot={slot} -r rc={rc_r} err={err_r!r}")
@@ -1096,6 +1276,10 @@ def edge_out_of_range_slot(platform):
     rc_w, out_w, err_w = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
     if rc_w != 4:
         record("genuine_failure", f"edge_out_of_range_slot platform={platform} slot={slot} -w rc={rc_w} err={err_w!r}")
+        ok = False
+    after = sha256(img)
+    if before != after:
+        record("genuine_failure", f"edge_out_of_range_slot platform={platform} slot={slot}: device changed despite refused out-of-range write")
         ok = False
     if ok:
         record("pass", f"edge_out_of_range_slot platform={platform} slot={slot} (fwcount={n})")
@@ -1315,6 +1499,18 @@ def edge_backup_twice_same_second(platform):
     else:
         record("genuine_failure", detail)
     cleanup(img, os.path.join(SCRATCH, f"{slot}.img"), *[os.path.join(SCRATCH, bn) for bn in names])
+
+
+SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
+                 scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
+                 scenario_shortcut_write, scenario_auto_detect, scenario_multi_read,
+                 scenario_duo_fwtutil_crosscheck, scenario_duo_fwtutil_crosscheck,
+                 edge_out_of_range_slot]
+SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
+                 scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
+                 scenario_shortcut_write, scenario_auto_detect, scenario_multi_read,
+                 scenario_mch_fwtablectl_crosscheck, scenario_mch_fwtablectl_crosscheck,
+                 edge_out_of_range_slot]
 
 
 EDGE_SCENARIOS_PLATFORMED = [

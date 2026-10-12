@@ -1,3 +1,4 @@
 /verona-tool
 /verona-tool-arm64
 *.img
+__pycache__/

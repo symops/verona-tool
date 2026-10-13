@@ -66,14 +66,6 @@ type args struct {
 	readMode  bool // bare -r present anywhere
 	writeMode bool // bare -w present anywhere
 
-	// bareRead/bareWrite: a -r/-w occurred with no attached SLOT[:FILE|=FILE]
-	// and no following value token to consume (the "just select a mode for
-	// a shortcut" form). Meaningless -- nothing to read/write -- unless a
-	// matching shortcut (one in the corresponding mode) is also present;
-	// checked once at the end of parseArgs, after shortcutsSeen is final.
-	bareRead  bool
-	bareWrite bool
-
 	backup        bool
 	backupFile    string
 	backupFileSet bool
@@ -221,9 +213,18 @@ func parseArgs(argv []string) (*args, error) {
 				}
 				a.reads = append(a.reads, slotFile{slot, file})
 			} else if name == "read" {
-				// bare --read: no slot given here (must come from a
-				// separate -r/--read=N occurrence or a shortcut).
-				a.bareRead = true
+				// bare --read: no slot given here -- valid only when
+				// immediately followed by a -k/-t/-f shortcut, which
+				// supplies the actual slot(s); that's the real-world
+				// pattern every legitimate "-r --kernel" invocation
+				// uses. NOT immediately followed by a shortcut means
+				// this occurrence is dangling and a usage error (this
+				// does NOT apply to valued -r, e.g. "-r 5:file", which
+				// remains legitimately repeatable, including appearing
+				// more than once).
+				if !nextIsShortcut(argv, i) {
+					return nil, fmt.Errorf("-r/--read with no slot must be immediately followed by a -k/-t/-f shortcut")
+				}
 			} else if i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
 				i++
 				slot, file, err := splitSlotSep(argv[i])
@@ -233,9 +234,10 @@ func parseArgs(argv []string) (*args, error) {
 				a.reads = append(a.reads, slotFile{slot, file})
 			} else {
 				// bare "-r" immediately followed by another flag, or at
-				// the end of argv: same "no slot given here" case as bare
-				// --read above.
-				a.bareRead = true
+				// the end of argv: same case as bare --read above.
+				if !nextIsShortcut(argv, i) {
+					return nil, fmt.Errorf("-r/--read with no slot must be immediately followed by a -k/-t/-f shortcut")
+				}
 			}
 		case "w", "write":
 			a.writeMode = true
@@ -261,9 +263,17 @@ func parseArgs(argv []string) (*args, error) {
 				}
 				a.writes = append(a.writes, slotFile{slot, file})
 			} else {
-				// bare -w/--write: no SLOT:FILE given here (must come from
-				// a shortcut's write-mode "=FILE" attachment instead).
-				a.bareWrite = true
+				// bare -w/--write: no SLOT:FILE given here -- valid
+				// only when immediately followed by a -k/-t/-f
+				// shortcut (its write-mode "=FILE" attachment
+				// supplies the actual slot(s) and file); same
+				// reasoning as bare -r above. Not immediately
+				// followed by a shortcut means this occurrence is
+				// dangling and a usage error (valued -w, e.g.
+				// "-w 5:file", remains legitimately repeatable).
+				if !nextIsShortcut(argv, i) {
+					return nil, fmt.Errorf("-w/--write with no SLOT:FILE must be immediately followed by a -k/-t/-f shortcut")
+				}
 			}
 		case "k", "kernel":
 			if err := a.addShortcut(shortcutKernel, hasAttached, attached); err != nil {
@@ -280,27 +290,6 @@ func parseArgs(argv []string) (*args, error) {
 		default:
 			return nil, fmt.Errorf("unknown flag %q", tok)
 		}
-	}
-
-	// A bare -r/-w (no attached SLOT[:FILE|=FILE]) only means something if
-	// a shortcut in the matching mode is also present to supply the
-	// actual slot(s) -- otherwise it's a silent no-op pretending to be a
-	// real read/write. Checked here, after shortcutsSeen is final,
-	// deliberately from the OTHER direction of the existing "-k/-t/-f
-	// requires -r or -w" rule enforced later in buildPlan.
-	hasReadShortcut, hasWriteShortcut := false, false
-	for _, s := range a.shortcutsSeen {
-		if _, isWrite := a.shortcutWriteFile[s]; isWrite {
-			hasWriteShortcut = true
-		} else {
-			hasReadShortcut = true
-		}
-	}
-	if a.bareRead && !hasReadShortcut {
-		return nil, fmt.Errorf("-r/--read given with no slot number and no -k/-t/-f shortcut (in read mode) to supply one")
-	}
-	if a.bareWrite && !hasWriteShortcut {
-		return nil, fmt.Errorf("-w/--write given with no SLOT:FILE and no -k/-t/-f shortcut (in write mode) to supply one")
 	}
 
 	return a, nil
@@ -327,4 +316,39 @@ func attachedOrNext(hasAttached bool, attached string, i *int, argv []string, fl
 
 func looksLikeFlag(tok string) bool {
 	return strings.HasPrefix(tok, "-")
+}
+
+// flagName extracts the canonical name from a "-x", "--long" or
+// "--long=value" token, stripping any attached value. Returns "" for a
+// token that isn't a flag at all.
+func flagName(tok string) string {
+	if strings.HasPrefix(tok, "--") {
+		body := tok[2:]
+		if eq := strings.IndexByte(body, '='); eq != -1 {
+			return body[:eq]
+		}
+		return body
+	}
+	if strings.HasPrefix(tok, "-") && len(tok) > 1 {
+		return tok[1:]
+	}
+	return ""
+}
+
+// nextIsShortcut reports whether argv[i+1] is one of the -k/-t/-f
+// shortcut flags (short or long form). A bare -r/-w immediately
+// followed by a shortcut IS giving that occurrence meaning (the
+// shortcut supplies the slot(s)) -- this is the real-world pattern
+// every legitimate "-r --kernel"/"-w --kernel=file" invocation uses,
+// and the basis for distinguishing a satisfied bare -r/-w from a
+// genuinely dangling one.
+func nextIsShortcut(argv []string, i int) bool {
+	if i+1 >= len(argv) {
+		return false
+	}
+	switch flagName(argv[i+1]) {
+	case "k", "kernel", "t", "dtb", "f", "rootfs":
+		return true
+	}
+	return false
 }

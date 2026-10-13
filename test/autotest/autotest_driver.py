@@ -1781,19 +1781,36 @@ def edge_missing_required_params(platform):
 
 
 def edge_bare_flag_without_shortcut(platform):
-    """Real bug found by the user: a bare -r/-w (no attached SLOT[:FILE
-    |=FILE], no following value token) interspersed among OTHER valid
-    valued -r/-w occurrences used to pass argument parsing silently --
-    the bare occurrence just got dropped, with nothing to show it was
-    ever meaningless, because the overall p.reads/p.writes list wasn't
-    empty (that masked it from the pre-existing "-r/-w given but no
-    slot" check, which only looks at the aggregate list). A bare -r/-w
-    only means something when a shortcut in the matching mode is also
-    present to supply the slot(s); otherwise it must be a clean usage
-    error (exit 1), not a silent no-op. Covers the user's exact two
-    example commands, the legitimate shortcut-mode cases (including
-    repeated shortcut mode, which must keep working), and bare -r/-w
-    with no shortcut at all."""
+    """Real bug found by the user, fixed in two rounds:
+
+    Round 1: a bare -r/-w (no attached SLOT[:FILE|=FILE], no following
+    value token) interspersed among OTHER valid valued -r/-w
+    occurrences used to pass argument parsing silently -- the bare
+    occurrence just got dropped, because the pre-existing "-r/-w given
+    but no slot" check only looks at the aggregate reads/writes list,
+    which wasn't empty thanks to the other valid occurrences.
+
+    Round 2: the round-1 fix only checked "is at least one shortcut
+    present ANYWHERE" as a global existence check, so it never caught
+    EXTRA bare -r/-w occurrences beyond the first meaningful one (e.g.
+    "-r --kernel -r -r --kernel -r" has a real shortcut present, so it
+    still passed). The user corrected an initial overcorrection on this
+    round too: the real rule is not "at most one bare -r in the whole
+    invocation" -- it's "every bare -r/-w must be immediately followed
+    by a -k/-t/-f shortcut, which gives THAT occurrence meaning." A
+    bare -r directly followed by a shortcut is satisfied, no matter how
+    many such (bare, shortcut) pairs appear; a bare -r/-w NOT
+    immediately followed by a shortcut (followed by another bare -r/
+    -w, by -w/-r with no shortcut, or by nothing at the end of argv) is
+    dangling and a usage error. This does NOT apply to VALUED -r/-w
+    (e.g. "-r 5:file"), which remains legitimately repeatable
+    throughout, including appearing more than once.
+
+    Covers the user's exact example commands from both rounds (plus
+    the user's own correction -- "-r --dtb -r --dtb" is legitimate,
+    NOT an error, since each bare -r there is immediately followed by
+    its own shortcut), the single-bare-plus-multiple-shortcuts case,
+    and confirms valued -r remains repeatable."""
     img = fresh(platform)
     ok = True
 
@@ -1804,29 +1821,52 @@ def edge_bare_flag_without_shortcut(platform):
             record("genuine_failure", f"edge_bare_flag_without_shortcut[{label}] platform={platform} rc={rc} (expected {expect}) err={err!r}")
             ok = False
 
-    # The user's exact two example commands (device doesn't need to
+    # Round 1's exact two example commands (device doesn't need to
     # exist -- the bug is that these used to pass parsing and reach the
     # open() call at all; now they must be rejected before that).
-    check("example1_bare_w_no_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
-                                          "-w", "-w", "1=1.img", "-w", "-w"])
-    check("example2_bare_r_no_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
-                                          "-r", "0", "-r", "1", "-r", "2", "-r", "-r", "-r", "4"])
+    check("r1_example1_bare_w_no_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                             "-w", "-w", "1=1.img", "-w", "-w"])
+    check("r1_example2_bare_r_no_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                             "-r", "0", "-r", "1", "-r", "2", "-r", "-r", "-r", "4"])
 
-    # Bare -r/-w alone, no shortcut at all.
+    # Round 2's exact two example commands: a real shortcut IS present,
+    # but at least one bare -r is NOT immediately followed by a
+    # shortcut (followed by another bare -r, or by -w) -- must be
+    # rejected despite a legitimate shortcut appearing elsewhere.
+    check("r2_example1_dangling_bare_r_with_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                                        "-r", "--kernel", "-r", "-r", "--kernel", "-r"])
+    check("r2_example2_dangling_bare_r_before_valued_w", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                                           "-r", "--kernel", "-r", "-w", "1:1.img"])
+
+    # Bare -r/-w alone, no shortcut at all -- dangling.
     check("bare_r_r_alone", ["-p", platform_flag(platform), "-d", img, "-r", "-r"])
     check("bare_w_w_alone", ["-p", platform_flag(platform), "-d", img, "-w", "-w"])
 
-    # Bare write with only a READ-mode shortcut present (the shortcut
-    # doesn't give the bare -w any meaning).
+    # Bare write immediately followed by nothing (end of argv), with
+    # only a READ-mode shortcut present earlier -- the earlier shortcut
+    # doesn't retroactively satisfy this dangling bare -w.
     check("bare_w_with_only_read_shortcut", ["-p", platform_flag(platform), "-d", img, "-r", "--dtb", "-w"])
     cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
 
-    # Legitimate: bare -r/-w + a matching-mode shortcut must still work.
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--dtb"])
+    # User's own correction: a bare -r repeated is fine as long as EACH
+    # occurrence is immediately followed by its own shortcut -- this is
+    # NOT a dangling bare -r and must succeed (duplicate reads of the
+    # same slots are explicitly allowed elsewhere in the spec, just a
+    # warning).
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--dtb", "-r", "--dtb"])
     if rc != 0:
-        record("genuine_failure", f"edge_bare_flag_without_shortcut[legit_bare_r_shortcut] platform={platform} rc={rc} err={err!r}")
+        record("genuine_failure", f"edge_bare_flag_without_shortcut[bare_r_repeated_each_with_own_shortcut] platform={platform} rc={rc} err={err!r}")
         ok = False
     cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
+
+    # Legitimate: exactly ONE bare -r immediately followed by multiple
+    # shortcuts must still succeed.
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--kernel", "--dtb"])
+    if rc != 0:
+        record("genuine_failure", f"edge_bare_flag_without_shortcut[legit_one_bare_r_multi_shortcut] platform={platform} rc={rc} err={err!r}")
+        ok = False
+    cleanup(os.path.join(os.getcwd(), "5.img"), os.path.join(os.getcwd(), "12.img"),
+            os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
 
     n = fwcount(img, platform)
     candidates = writable_slots(img, platform, n)
@@ -1839,13 +1879,12 @@ def edge_bare_flag_without_shortcut(platform):
             ok = False
         cleanup(kfile)
 
-    # Repeated shortcut mode must still work (duplicate reads are
-    # explicitly allowed elsewhere in the spec).
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--dtb", "-r", "--dtb"])
+    # Valued -r remains legitimately repeatable throughout both rounds.
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "0", "-r", "1"])
     if rc != 0:
-        record("genuine_failure", f"edge_bare_flag_without_shortcut[repeated_shortcut_mode] platform={platform} rc={rc} err={err!r}")
+        record("genuine_failure", f"edge_bare_flag_without_shortcut[valued_r_still_repeatable] platform={platform} rc={rc} err={err!r}")
         ok = False
-    cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
+    cleanup(os.path.join(os.getcwd(), "0.img"), os.path.join(os.getcwd(), "1.img"))
 
     if ok:
         record("pass", f"edge_bare_flag_without_shortcut platform={platform}")

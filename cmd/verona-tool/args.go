@@ -106,6 +106,21 @@ func splitSlotSep(tok string) (slot int, file string, err error) {
 func parseArgs(argv []string) (*args, error) {
 	a := &args{shortcutWriteFile: map[shortcut]string{}}
 
+	// Flags that aren't meant to be repeated (unlike -r/-w and the
+	// shortcuts, which are legitimately repeatable, or -h/--help and
+	// -v/--version, which are already caught by main.go's "must be used
+	// alone" check against argv's total length). A second occurrence of
+	// any of these -- even with an identical value -- is a usage error
+	// rather than silently keeping the last (or first) one.
+	seen := map[string]bool{}
+	checkOnce := func(key, label string) error {
+		if seen[key] {
+			return fmt.Errorf("%s given more than once", label)
+		}
+		seen[key] = true
+		return nil
+	}
+
 	for i := 0; i < len(argv); i++ {
 		tok := argv[i]
 		var name, attached string
@@ -129,30 +144,51 @@ func parseArgs(argv []string) (*args, error) {
 		case "v", "version":
 			a.version = true
 		case "n", "dry-run":
+			if err := checkOnce("dry-run", "-n/--dry-run"); err != nil {
+				return nil, err
+			}
 			a.dryRun = true
 		case "D", "debug":
+			if err := checkOnce("debug", "-D/--debug"); err != nil {
+				return nil, err
+			}
 			a.debug = true
 		case "l", "list":
+			if err := checkOnce("list", "-l/--list"); err != nil {
+				return nil, err
+			}
 			a.list = true
 		case "p", "platform":
+			if err := checkOnce("platform", "-p/--platform"); err != nil {
+				return nil, err
+			}
 			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-p/--platform")
 			if err != nil {
 				return nil, err
 			}
 			a.platform = v
 		case "d", "device":
+			if err := checkOnce("device", "-d/--device"); err != nil {
+				return nil, err
+			}
 			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-d/--device")
 			if err != nil {
 				return nil, err
 			}
 			a.device = v
 		case "R", "restore":
+			if err := checkOnce("restore", "-R/--restore"); err != nil {
+				return nil, err
+			}
 			v, err := attachedOrNext(hasAttached, attached, &i, argv, "-R/--restore")
 			if err != nil {
 				return nil, err
 			}
 			a.restore = v
 		case "B", "backup":
+			if err := checkOnce("backup", "-B/--backup"); err != nil {
+				return nil, err
+			}
 			a.backup = true
 			// -B/--backup FILE is optional. Only long form may carry it
 			// attached (--backup=file); for the short form we peek at the

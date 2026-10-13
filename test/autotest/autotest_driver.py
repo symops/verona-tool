@@ -744,6 +744,98 @@ def scenario_duo_fwtutil_crosscheck(platform):
     cleanup(img, src)
 
 
+def scenario_duo_fwtutil_multiflag(platform):
+    """Multiple -r/-x flags in a SINGLE real fwtutil invocation, including
+    a mix of both in one call (e.g. "-x A -r B -x C") -- mirrors the
+    multi-flag coverage scenario_multi_read already gives verona-tool's
+    own -r/-w. The real fwtutil processes flags in literal command-line
+    order (confirmed directly against its own output: an -x between two
+    other flags prints its "Извлечение" line between their output lines,
+    not batched before/after like verona-tool's "all -r before any -w"),
+    but since the read slots and write slots chosen here are always
+    disjoint, that ordering difference can't affect the final byte
+    state -- only the two tools' internal processing order, which this
+    scenario doesn't care about. Each read is cross-checked against the
+    equivalent verona-tool multi-flag -r result for the same slots (a
+    single verona-tool invocation with multiple -r, the same structure
+    scenario_multi_read already exercises for verona-tool alone), and
+    each write is cross-checked via an independent byte-level read."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if len(candidates) < 3:
+        cleanup(img)
+        return
+
+    pool = candidates[:]
+    random.shuffle(pool)
+    read_slots = [s for s, _ in pool[:2]]
+    write_pool = pool[2:4] if len(pool) >= 4 else pool[2:3]
+    write_slots = [(s, b) for s, b in write_pool]
+
+    if img != "/dev/mmcblk0":
+        try:
+            os.remove("/dev/mmcblk0")
+        except OSError:
+            pass
+        os.symlink(img, "/dev/mmcblk0")
+
+    fwtutil_args = []
+    read_outs = {}
+    write_srcs = {}
+    # Interleave -x/-r in a fixed, readable order: alternate starting
+    # with whichever kind has more entries, so a 2-read/2-write call
+    # comes out "-x -r -x -r" (and a 2-read/1-write call "-x -r -x").
+    reads_left = list(read_slots)
+    writes_left = list(write_slots)
+    while reads_left or writes_left:
+        if reads_left:
+            s = reads_left.pop(0)
+            out = test_path(f"fwm{s}", ".img")
+            read_outs[s] = out
+            fwtutil_args += ["-x", f"{s}:{out}"]
+        if writes_left:
+            s, b = writes_left.pop(0)
+            src = test_path(f"fwmw{s}", ".bin")
+            gen_random_file(src, random.randint(1, min(b, 1 << 16)))
+            write_srcs[s] = src
+            fwtutil_args += ["-r", f"{s}:{src}"]
+
+    rc, out, err = fwtutil(fwtutil_args)
+    if rc != 0:
+        record("genuine_failure", f"duo_fwtutil_multiflag platform={platform} reads={read_slots} writes={[s for s,_ in write_slots]} rc={rc} err={err!r}")
+        cleanup(img, *read_outs.values(), *write_srcs.values())
+        return
+
+    # Cross-check the reads against a single verona-tool multi-flag -r
+    # invocation for the exact same slots.
+    vargs = ["-p", platform_flag(platform), "-d", img]
+    verona_outs = {}
+    for s in read_slots:
+        verona_outs[s] = test_path(f"fwmv{s}", ".img")
+        vargs += ["-r", f"{s}{sep()}{verona_outs[s]}"]
+    rc2, out2, err2 = verona(vargs)
+    ok = True
+    if rc2 != 0:
+        record("genuine_failure", f"duo_fwtutil_multiflag verona-crosscheck platform={platform} reads={read_slots} rc={rc2} err={err2!r}")
+        ok = False
+    else:
+        for s in read_slots:
+            with open(read_outs[s], "rb") as f1, open(verona_outs[s], "rb") as f2:
+                if f1.read() != f2.read():
+                    record("genuine_failure", f"duo_fwtutil_multiflag platform={platform} slot={s}: fwtutil -x result differs from verona-tool -r result")
+                    ok = False
+
+    # Cross-check the writes via an independent byte-level read.
+    for s, src in write_srcs.items():
+        if not verify_payload(img, platform, s, src, f"duo_fwtutil_multiflag platform={platform} slot={s}"):
+            ok = False
+
+    if ok:
+        record("pass", f"duo_fwtutil_multiflag platform={platform} reads={read_slots} writes={list(write_srcs)}")
+    cleanup(img, *read_outs.values(), *write_srcs.values(), *verona_outs.values())
+
+
 def scenario_mch_fwtablectl_crosscheck(platform):
     """Dedicated, frequent cross-validation against the real fwtablectl
     for Monarch: write via verona-tool on img_a, apply the identical
@@ -1556,6 +1648,7 @@ SCENARIOS_DUO = [scenario_single_write, scenario_sequential_overwrites, scenario
                  scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
                  scenario_shortcut_write, scenario_multi_read,
                  scenario_duo_fwtutil_crosscheck, scenario_duo_fwtutil_crosscheck,
+                 scenario_duo_fwtutil_multiflag, scenario_duo_fwtutil_multiflag,
                  edge_out_of_range_slot]
 SCENARIOS_MCH = [scenario_single_write, scenario_sequential_overwrites, scenario_refusal,
                  scenario_backup_restore_list, scenario_list_check, scenario_shortcut_read,
@@ -1590,6 +1683,100 @@ def edge_arg_fuzzing(platform):
     if ok:
         record("pass", f"edge_arg_fuzzing platform={platform}")
     cleanup(img, os.path.join(os.getcwd(), "0.img"))
+
+
+def edge_flag_empty_or_missing_values(platform):
+    """Every flag that takes a value, tried with that value missing or
+    empty (not just -w, already covered by edge_arg_fuzzing): -p, -d
+    (mch's required case), -r, -R, -B (via --backup= specifically),
+    and the -k/-t/-f shortcuts both alone (no -r/-w to select a mode)
+    and in write mode with no/empty file. All must cleanly refuse
+    (exit 1), never crash."""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != 1:
+            record("genuine_failure", f"edge_flag_empty_or_missing_values[{label}] platform={platform} rc={rc} err={err!r}")
+            ok = False
+
+    check("p_empty", ["-p", "", "-d", img, "-l"])
+    check("p_missing", ["-p"])
+    check("d_empty_mch", ["-p", "mch", "-d", "", "-l"])
+    check("r_empty", ["-p", platform_flag(platform), "-d", img, "-r", ""])
+    check("R_missing", ["-p", platform_flag(platform), "-d", img, "-R"])
+    check("B_empty_filename", ["-p", platform_flag(platform), "-d", img, "--backup=", "-r", "0"])
+    check("kernel_alone_no_mode", ["-p", platform_flag(platform), "-d", img, "-k"])
+    check("dtb_alone_no_mode", ["-p", platform_flag(platform), "-d", img, "-t"])
+    check("rootfs_alone_no_mode", ["-p", platform_flag(platform), "-d", img, "-f"])
+    check("kernel_write_no_file", ["-p", platform_flag(platform), "-d", img, "-w", "--kernel"])
+    check("kernel_write_empty_file", ["-p", platform_flag(platform), "-d", img, "-w", "--kernel="])
+
+    if ok:
+        record("pass", f"edge_flag_empty_or_missing_values platform={platform}")
+    cleanup(img, os.path.join(os.getcwd(), "0.img"))
+
+
+def edge_repeated_nonrepeatable_flags(platform):
+    """Flags that are NOT meant to be repeated -- unlike -r/-w and the
+    shortcuts (which legitimately repeat; a shortcut given twice in
+    write mode is covered separately as a slot conflict, exit 5, by
+    edge_duplicate_write_shortcut_collision) -- must cleanly refuse a
+    second occurrence (exit 1) rather than silently keeping the last
+    (or first) value or crashing. Non-repeatable: -p, -d, -l, -R, -B,
+    -n, -D. (-h/-v are already covered by main.go's "must be used
+    alone" check against argv's total length, exercised by
+    edge_help_version_combined.)"""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != 1:
+            record("genuine_failure", f"edge_repeated_nonrepeatable_flags[{label}] platform={platform} rc={rc} err={err!r}")
+            ok = False
+
+    check("p_twice", ["-p", "duo", "-p", "mch", "-d", img, "-l"])
+    check("d_twice", ["-p", platform_flag(platform), "-d", img, "-d", img, "-l"])
+    check("l_twice", ["-p", platform_flag(platform), "-d", img, "-l", "-l"])
+    check("n_twice", ["-p", platform_flag(platform), "-d", img, "-n", "-n", "-r", "0"])
+    check("D_twice", ["-p", platform_flag(platform), "-d", img, "-D", "-D", "-r", "0"])
+    check("B_twice", ["-p", platform_flag(platform), "-d", img, "-B", "-B", "-r", "0"])
+    check("R_twice", ["-p", platform_flag(platform), "-d", img, "-R", "/tmp/a.img", "-R", "/tmp/b.img"])
+
+    if ok:
+        record("pass", f"edge_repeated_nonrepeatable_flags platform={platform}")
+    cleanup(img, os.path.join(os.getcwd(), "0.img"))
+
+
+def edge_missing_required_params(platform):
+    """Commands missing a required parameter must cleanly refuse (exit
+    1) rather than crash: no -p at all, no args at all, -w/-R with no
+    value, -d omitted when required for mch, and -p/-d given but no
+    action flag (-r/-w/-l/-R/-B) at all."""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != 1:
+            record("genuine_failure", f"edge_missing_required_params[{label}] platform={platform} rc={rc} err={err!r}")
+            ok = False
+
+    check("no_p_at_all", ["-d", img, "-l"])
+    check("no_args_at_all", [])
+    check("w_no_value", ["-p", platform_flag(platform), "-d", img, "-w"])
+    check("R_no_value", ["-p", platform_flag(platform), "-d", img, "-R"])
+    check("mch_no_d", ["-p", "mch", "-l"])
+    check("no_action_flag", ["-p", platform_flag(platform), "-d", img])
+
+    if ok:
+        record("pass", f"edge_missing_required_params platform={platform}")
+    cleanup(img)
 
 
 def edge_kill_mid_write_lock_release(platform):
@@ -1938,6 +2125,8 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_debug_flag,
     edge_arg_fuzzing, edge_kill_mid_write_lock_release, edge_debug_and_dryrun_combined,
     edge_idempotent_rewrite, edge_list_empty_entries, edge_same_path_read_then_write,
+    edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
+    edge_missing_required_params,
 ]
 EDGE_SCENARIOS_NOARG = [edge_help_version_combined, edge_gpt_no_fw_table, edge_fw_table_no_signature,
                          edge_doc_platform_aliases, edge_doc_exit_codes, edge_disk_full_read_output,

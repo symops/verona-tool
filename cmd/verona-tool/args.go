@@ -204,16 +204,27 @@ func parseArgs(argv []string) (*args, error) {
 			}
 		case "r", "read":
 			a.readMode = true
-			// Optional SLOT[:FILE]; short form peeks next token, long form
-			// requires attachment if any.
+			// Optional SLOT[:FILE]: both short (-r) and long (--read)
+			// forms accept it either attached ("--read=2") or as a
+			// separate following token ("-r 2", "--read 2") -- there's
+			// no flag/value ambiguity for a numeric slot the way there
+			// is for the shortcuts' optional FILE argument, so both
+			// spellings peek the next token identically.
 			if hasAttached {
 				slot, file, err := splitSlotSep(attached)
 				if err != nil {
 					return nil, err
 				}
 				a.reads = append(a.reads, slotFile{slot, file})
-			} else if name == "read" {
-				// bare --read: no slot given here -- valid only when
+			} else if i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
+				i++
+				slot, file, err := splitSlotSep(argv[i])
+				if err != nil {
+					return nil, err
+				}
+				a.reads = append(a.reads, slotFile{slot, file})
+			} else {
+				// bare -r/--read: no slot given here -- valid only when
 				// immediately followed by a -k/-t/-f shortcut, which
 				// supplies the actual slot(s); that's the real-world
 				// pattern every legitimate "-r --kernel" invocation
@@ -225,19 +236,6 @@ func parseArgs(argv []string) (*args, error) {
 				if !nextIsShortcut(argv, i) {
 					return nil, fmt.Errorf("-r/--read with no slot must be immediately followed by a -k/-t/-f shortcut")
 				}
-			} else if i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
-				i++
-				slot, file, err := splitSlotSep(argv[i])
-				if err != nil {
-					return nil, err
-				}
-				a.reads = append(a.reads, slotFile{slot, file})
-			} else {
-				// bare "-r" immediately followed by another flag, or at
-				// the end of argv: same case as bare --read above.
-				if !nextIsShortcut(argv, i) {
-					return nil, fmt.Errorf("-r/--read with no slot must be immediately followed by a -k/-t/-f shortcut")
-				}
 			}
 		case "w", "write":
 			a.writeMode = true
@@ -245,11 +243,13 @@ func parseArgs(argv []string) (*args, error) {
 			var got bool
 			if hasAttached {
 				tokv, got = attached, true
-			} else if name != "write" && i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
-				// Bare "-w" immediately followed by a flag (e.g. a
-				// shortcut's "--kernel=file") just selects write mode,
-				// the same as bare "--write" -- it must NOT swallow that
-				// flag as its own malformed SLOT:FILE value.
+			} else if i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
+				// A following token that doesn't itself look like a flag
+				// is unambiguously this -w/--write's SLOT[:FILE] value --
+				// true for both spellings alike. (A following token that
+				// DOES look like a flag, e.g. a shortcut's "--kernel=
+				// file", is deliberately NOT consumed here -- it must
+				// not be swallowed as a malformed SLOT:FILE value.)
 				i++
 				tokv, got = argv[i], true
 			}

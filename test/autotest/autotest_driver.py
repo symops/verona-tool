@@ -1780,6 +1780,62 @@ def edge_missing_required_params(platform):
     cleanup(img)
 
 
+def edge_long_form_space_separated_value(platform):
+    """Real bug found by the user: --read/--write (long form) only ever
+    accepted an attached "=value" (--read=2), never a space-separated
+    following token the way -r/-w (short form) do -- so "--read 2"
+    was wrongly treated as the BARE form (no slot at all), checked
+    whether "2" was a -k/-t/-f shortcut (it isn't), and errored. A
+    numeric slot immediately after --read/--write is unambiguous (no
+    flag/value ambiguity the way there is for the shortcuts' optional
+    FILE argument), so both spellings must peek the next token
+    identically. Covers the user's exact repro plus the coordinator's
+    SLOT:FILE-form repro for --write, confirms the attached "=" form
+    still works for both, and confirms short forms are unaffected."""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args, expect=0):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != expect:
+            record("genuine_failure", f"edge_long_form_space_separated_value[{label}] platform={platform} rc={rc} (expected {expect}) err={err!r}")
+            ok = False
+
+    # User's exact repro and the coordinator's follow-up repro (device
+    # doesn't need to exist -- the bug is that these used to error
+    # during argument parsing at all; now they must reach open()).
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist", "--read", "2"])
+    if rc == 1:
+        record("genuine_failure", f"edge_long_form_space_separated_value[user_repro_read_2] platform={platform}: still rejected at argument-parsing time (rc=1) err={err!r}")
+        ok = False
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist", "--write", "2:2.img"])
+    if rc == 1:
+        record("genuine_failure", f"edge_long_form_space_separated_value[coordinator_repro_write] platform={platform}: still rejected at argument-parsing time (rc=1) err={err!r}")
+        ok = False
+
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if candidates:
+        slot, boundary = random.choice(candidates)
+        src = test_path("lfspace", ".bin")
+        gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
+        out_r = test_path("lfspaceout", ".img")
+
+        check("read_space_separated", ["-p", platform_flag(platform), "-d", img, "--read", f"{slot}:{out_r}"])
+        check("write_space_separated", ["-p", platform_flag(platform), "-d", img, "--write", f"{slot}:{src}"])
+        if not verify_payload(img, platform, slot, src, f"edge_long_form_space_separated_value[write_space_separated] platform={platform} slot={slot}"):
+            ok = False
+        check("read_attached_form", ["-p", platform_flag(platform), "-d", img, f"--read={slot}:{out_r}"])
+        check("write_attached_form", ["-p", platform_flag(platform), "-d", img, f"--write={slot}:{src}"])
+        check("short_form_unaffected", ["-p", platform_flag(platform), "-d", img, "-r", f"{slot}:{out_r}"])
+        cleanup(src, out_r)
+
+    if ok:
+        record("pass", f"edge_long_form_space_separated_value platform={platform}")
+    cleanup(img)
+
+
 def edge_bare_flag_without_shortcut(platform):
     """Real bug found by the user, fixed in two rounds:
 
@@ -2447,6 +2503,7 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_idempotent_rewrite, edge_list_empty_entries, edge_same_path_read_then_write,
     edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
     edge_missing_required_params, edge_bare_flag_without_shortcut,
+    edge_long_form_space_separated_value,
     edge_exact_boundary_write, edge_cross_device_lock_independence,
     edge_readonly_device, edge_backup_bitflip_corruption,
 ]

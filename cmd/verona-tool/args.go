@@ -66,6 +66,14 @@ type args struct {
 	readMode  bool // bare -r present anywhere
 	writeMode bool // bare -w present anywhere
 
+	// bareRead/bareWrite: a -r/-w occurred with no attached SLOT[:FILE|=FILE]
+	// and no following value token to consume (the "just select a mode for
+	// a shortcut" form). Meaningless -- nothing to read/write -- unless a
+	// matching shortcut (one in the corresponding mode) is also present;
+	// checked once at the end of parseArgs, after shortcutsSeen is final.
+	bareRead  bool
+	bareWrite bool
+
 	backup        bool
 	backupFile    string
 	backupFileSet bool
@@ -215,6 +223,7 @@ func parseArgs(argv []string) (*args, error) {
 			} else if name == "read" {
 				// bare --read: no slot given here (must come from a
 				// separate -r/--read=N occurrence or a shortcut).
+				a.bareRead = true
 			} else if i+1 < len(argv) && !looksLikeFlag(argv[i+1]) {
 				i++
 				slot, file, err := splitSlotSep(argv[i])
@@ -222,6 +231,11 @@ func parseArgs(argv []string) (*args, error) {
 					return nil, err
 				}
 				a.reads = append(a.reads, slotFile{slot, file})
+			} else {
+				// bare "-r" immediately followed by another flag, or at
+				// the end of argv: same "no slot given here" case as bare
+				// --read above.
+				a.bareRead = true
 			}
 		case "w", "write":
 			a.writeMode = true
@@ -246,6 +260,10 @@ func parseArgs(argv []string) (*args, error) {
 					return nil, fmt.Errorf("-w requires SLOT:FILE or SLOT=FILE (filename missing for slot %d)", slot)
 				}
 				a.writes = append(a.writes, slotFile{slot, file})
+			} else {
+				// bare -w/--write: no SLOT:FILE given here (must come from
+				// a shortcut's write-mode "=FILE" attachment instead).
+				a.bareWrite = true
 			}
 		case "k", "kernel":
 			if err := a.addShortcut(shortcutKernel, hasAttached, attached); err != nil {
@@ -263,6 +281,28 @@ func parseArgs(argv []string) (*args, error) {
 			return nil, fmt.Errorf("unknown flag %q", tok)
 		}
 	}
+
+	// A bare -r/-w (no attached SLOT[:FILE|=FILE]) only means something if
+	// a shortcut in the matching mode is also present to supply the
+	// actual slot(s) -- otherwise it's a silent no-op pretending to be a
+	// real read/write. Checked here, after shortcutsSeen is final,
+	// deliberately from the OTHER direction of the existing "-k/-t/-f
+	// requires -r or -w" rule enforced later in buildPlan.
+	hasReadShortcut, hasWriteShortcut := false, false
+	for _, s := range a.shortcutsSeen {
+		if _, isWrite := a.shortcutWriteFile[s]; isWrite {
+			hasWriteShortcut = true
+		} else {
+			hasReadShortcut = true
+		}
+	}
+	if a.bareRead && !hasReadShortcut {
+		return nil, fmt.Errorf("-r/--read given with no slot number and no -k/-t/-f shortcut (in read mode) to supply one")
+	}
+	if a.bareWrite && !hasWriteShortcut {
+		return nil, fmt.Errorf("-w/--write given with no SLOT:FILE and no -k/-t/-f shortcut (in write mode) to supply one")
+	}
+
 	return a, nil
 }
 

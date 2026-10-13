@@ -1780,6 +1780,78 @@ def edge_missing_required_params(platform):
     cleanup(img)
 
 
+def edge_bare_flag_without_shortcut(platform):
+    """Real bug found by the user: a bare -r/-w (no attached SLOT[:FILE
+    |=FILE], no following value token) interspersed among OTHER valid
+    valued -r/-w occurrences used to pass argument parsing silently --
+    the bare occurrence just got dropped, with nothing to show it was
+    ever meaningless, because the overall p.reads/p.writes list wasn't
+    empty (that masked it from the pre-existing "-r/-w given but no
+    slot" check, which only looks at the aggregate list). A bare -r/-w
+    only means something when a shortcut in the matching mode is also
+    present to supply the slot(s); otherwise it must be a clean usage
+    error (exit 1), not a silent no-op. Covers the user's exact two
+    example commands, the legitimate shortcut-mode cases (including
+    repeated shortcut mode, which must keep working), and bare -r/-w
+    with no shortcut at all."""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args, expect=1):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != expect:
+            record("genuine_failure", f"edge_bare_flag_without_shortcut[{label}] platform={platform} rc={rc} (expected {expect}) err={err!r}")
+            ok = False
+
+    # The user's exact two example commands (device doesn't need to
+    # exist -- the bug is that these used to pass parsing and reach the
+    # open() call at all; now they must be rejected before that).
+    check("example1_bare_w_no_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                          "-w", "-w", "1=1.img", "-w", "-w"])
+    check("example2_bare_r_no_shortcut", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                          "-r", "0", "-r", "1", "-r", "2", "-r", "-r", "-r", "4"])
+
+    # Bare -r/-w alone, no shortcut at all.
+    check("bare_r_r_alone", ["-p", platform_flag(platform), "-d", img, "-r", "-r"])
+    check("bare_w_w_alone", ["-p", platform_flag(platform), "-d", img, "-w", "-w"])
+
+    # Bare write with only a READ-mode shortcut present (the shortcut
+    # doesn't give the bare -w any meaning).
+    check("bare_w_with_only_read_shortcut", ["-p", platform_flag(platform), "-d", img, "-r", "--dtb", "-w"])
+    cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
+
+    # Legitimate: bare -r/-w + a matching-mode shortcut must still work.
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--dtb"])
+    if rc != 0:
+        record("genuine_failure", f"edge_bare_flag_without_shortcut[legit_bare_r_shortcut] platform={platform} rc={rc} err={err!r}")
+        ok = False
+    cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
+
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if candidates:
+        kfile = test_path("bareshortcut", ".bin")
+        gen_random_file(kfile, 1024)
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"--kernel={kfile}"])
+        if rc != 0:
+            record("genuine_failure", f"edge_bare_flag_without_shortcut[legit_bare_w_shortcut] platform={platform} rc={rc} err={err!r}")
+            ok = False
+        cleanup(kfile)
+
+    # Repeated shortcut mode must still work (duplicate reads are
+    # explicitly allowed elsewhere in the spec).
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--dtb", "-r", "--dtb"])
+    if rc != 0:
+        record("genuine_failure", f"edge_bare_flag_without_shortcut[repeated_shortcut_mode] platform={platform} rc={rc} err={err!r}")
+        ok = False
+    cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
+
+    if ok:
+        record("pass", f"edge_bare_flag_without_shortcut platform={platform}")
+    cleanup(img)
+
+
 def edge_kill_mid_write_lock_release(platform):
     """Kill verona-tool (SIGKILL or SIGTERM) partway through a -w and
     confirm the flock on the device is released when the process dies,
@@ -2335,7 +2407,7 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_arg_fuzzing, edge_kill_mid_write_lock_release, edge_debug_and_dryrun_combined,
     edge_idempotent_rewrite, edge_list_empty_entries, edge_same_path_read_then_write,
     edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
-    edge_missing_required_params,
+    edge_missing_required_params, edge_bare_flag_without_shortcut,
     edge_exact_boundary_write, edge_cross_device_lock_independence,
     edge_readonly_device, edge_backup_bitflip_corruption,
 ]

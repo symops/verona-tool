@@ -19,6 +19,7 @@ FWTUTIL = "/opt/tools/fwtutil"
 FWTABLECTL = "/opt/tools/fwtablectl"
 GOLDEN_DUO = "/root/work/golden/duo-golden.img"
 GOLDEN_MCH = "/root/work/golden/monarch-golden.img"
+GOLDEN_MCH_128PARTS = "/root/work/golden/monarch-golden-128parts.img"
 SCRATCH = "/root/work/scratch"
 LOGFILE = "/root/work/autotest.log"
 RESULTS = "/root/work/results.jsonl"
@@ -2114,6 +2115,214 @@ def edge_disk_full_read_output():
     cleanup(img)
 
 
+def edge_exact_boundary_write(platform):
+    """A write whose size is EXACTLY equal to the computed boundary (not
+    one byte under, not one byte over) must succeed cleanly -- the
+    classic >= vs > off-by-one at the boundary comparison. Paired here
+    with scenario_refusal's existing one-byte-over coverage so both
+    sides of the exact boundary are explicitly exercised."""
+    img = fresh(platform)
+    n = fwcount(img, platform)
+    candidates = writable_slots(img, platform, n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, boundary = random.choice(candidates)
+    src = test_path("exact", ".bin")
+    gen_random_file(src, boundary)
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{slot}{sep()}{src}"])
+    ok = True
+    if rc != 0:
+        record("genuine_failure", f"edge_exact_boundary_write platform={platform} slot={slot} boundary={boundary} rc={rc} err={err!r}")
+        ok = False
+    elif not verify_payload(img, platform, slot, src, f"edge_exact_boundary_write platform={platform} slot={slot}"):
+        ok = False
+    if ok:
+        record("pass", f"edge_exact_boundary_write platform={platform} slot={slot} boundary={boundary}")
+    cleanup(img, src)
+
+
+def edge_cross_device_lock_independence(platform):
+    """flock must be scoped to the actual device/file, not some shared
+    or global lock object: holding an exclusive lock on device A must
+    not block a write against a completely different device B. Unlike
+    edge_concurrent_write_lock (same device, correctly blocks), this
+    must proceed immediately."""
+    img_a = fresh(platform)
+    img_b = fresh(platform)
+    n = fwcount(img_b, platform)
+    candidates = writable_slots(img_b, platform, n)
+    if not candidates:
+        cleanup(img_a, img_b)
+        return
+    slot, boundary = random.choice(candidates)
+    src = test_path("xdev", ".bin")
+    gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
+
+    fd_a = os.open(img_a, os.O_RDWR)
+    try:
+        fcntl.flock(fd_a, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        t0 = time.time()
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img_b, "-w", f"{slot}{sep()}{src}"])
+        elapsed = time.time() - t0
+        if rc == 0 and elapsed < 5:
+            record("pass", f"edge_cross_device_lock_independence platform={platform} slot={slot} elapsed={elapsed:.3f}s")
+        else:
+            record("genuine_failure", f"edge_cross_device_lock_independence platform={platform} slot={slot} rc={rc} elapsed={elapsed:.3f}s err={err!r}")
+    finally:
+        os.close(fd_a)
+    cleanup(img_a, img_b, src)
+
+
+def edge_readonly_device(platform):
+    """-d pointed at a read-only file: -w must fail cleanly (a
+    permission/read-only-filesystem style error, not a crash or
+    confusing message); -r and -l against the same read-only -d must
+    still succeed. Plain chmod doesn't work here since this harness
+    runs as root (which bypasses permission bits) -- a bind-mount
+    remounted read-only is a real filesystem-level restriction even
+    root can't write through."""
+    img = fresh(platform)
+    mount_point = os.path.join(SCRATCH, f"ro-mount-{random.randint(0, 1 << 30)}")
+    os.makedirs(mount_point, exist_ok=True)
+    ro_path = os.path.join(mount_point, "ro.img")
+    with open(ro_path, "wb"):
+        pass
+    r1 = subprocess.run(["mount", "--bind", img, ro_path], capture_output=True)
+    if r1.returncode != 0:
+        record("expected_divergence", f"edge_readonly_device: bind mount unavailable in this container ({r1.stderr.decode('utf-8','replace').strip()}) -- skipping, not a verona-tool issue")
+        cleanup(img)
+        try:
+            os.rmdir(mount_point)
+        except OSError:
+            pass
+        return
+    subprocess.run(["mount", "-o", "remount,ro,bind", ro_path], capture_output=True, check=True)
+    try:
+        n = fwcount(ro_path, platform)
+        candidates = writable_slots(ro_path, platform, n)
+        ok = True
+        if candidates:
+            slot, boundary = random.choice(candidates)
+            src = test_path("rosrc", ".bin")
+            gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
+            rc_w, out_w, err_w = verona(["-p", platform_flag(platform), "-d", ro_path, "-w", f"{slot}{sep()}{src}"])
+            if rc_w == 0:
+                record("genuine_failure", f"edge_readonly_device platform={platform}: -w succeeded against a read-only device")
+                ok = False
+            cleanup(src)
+        read_slot = random.randint(0, n - 1)
+        rc_r, out_r, err_r = verona(["-p", platform_flag(platform), "-d", ro_path, "-r", str(read_slot)])
+        rc_l, out_l, err_l = verona(["-p", platform_flag(platform), "-d", ro_path, "-l"])
+        if rc_r != 0 or rc_l != 0:
+            record("genuine_failure", f"edge_readonly_device platform={platform}: -r/-l failed against a read-only device (rc_r={rc_r} rc_l={rc_l})")
+            ok = False
+        if ok:
+            record("pass", f"edge_readonly_device platform={platform}")
+        cleanup(os.path.join(os.getcwd(), f"{read_slot}.img"))
+    finally:
+        subprocess.run(["umount", ro_path], capture_output=True)
+        cleanup(img)
+        try:
+            os.remove(ro_path)
+            os.rmdir(mount_point)
+        except OSError:
+            pass
+
+
+def edge_backup_bitflip_corruption(platform):
+    """A well-formed backup file (correct size, correct PartListLen/
+    FwListLen alignment) with a bit flipped in the middle of its DATA
+    (inside the part/fw entries, which are checksummed -- not the
+    header, not the trailing zero padding out to Paddings, which
+    isn't) must be refused with the same checksum-mismatch error as
+    other corruption cases. Distinct from the already-covered
+    truncated (edge_restore_corrupted) and oversized-Paddings
+    (edge_restore_oversized_paddings) cases."""
+    img = fresh(platform)
+    backup = test_path("flip", ".img")
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-B", backup, "-r", "0"])
+    if rc != 0:
+        record("genuine_failure", f"edge_backup_bitflip_corruption platform={platform} backup rc={rc} err={err!r}")
+        cleanup(img, backup, os.path.join(os.getcwd(), "0.img"))
+        return
+    with open(backup, "r+b") as f:
+        data = bytearray(f.read())
+        mid = len(data) // 2  # inside the checksummed part/fw-entry region
+        data[mid] ^= 0xFF
+        f.seek(0)
+        f.write(data)
+    rc2, out2, err2 = verona(["-p", platform_flag(platform), "-d", img, "-R", backup])
+    if rc2 == 2:
+        record("pass", f"edge_backup_bitflip_corruption platform={platform}")
+    else:
+        record("genuine_failure", f"edge_backup_bitflip_corruption platform={platform} rc={rc2} err={err2!r}")
+    cleanup(img, backup, os.path.join(os.getcwd(), "0.img"))
+
+
+def edge_cross_platform_restore_pinned():
+    """KNOWN, INTENTIONAL LIMITATION -- pinned here so a future change
+    doesn't silently alter this in either direction without someone
+    noticing: a backup taken with -p duo and restored onto a -p mch
+    target (or vice versa) currently SUCCEEDS. The VERONA table format
+    is byte-identical between platforms and nothing enforces platform-
+    matching (a deliberate design decision not to add a wrapper
+    format around it) -- restoring a Duo table onto a Monarch device
+    silently makes it look like a Duo table (and vice versa). If this
+    scenario starts failing, that means platform-matching enforcement
+    was added somewhere and this pin needs to be updated deliberately,
+    not treated as an accidental regression."""
+    img_duo = fresh("duo")
+    img_mch = fresh("mch")
+    backup = test_path("xplat", ".img")
+    rc1, out1, err1 = verona(["-p", platform_flag("duo"), "-d", img_duo, "-B", backup, "-r", "0"])
+    if rc1 != 0:
+        record("genuine_failure", f"edge_cross_platform_restore_pinned: duo backup rc={rc1} err={err1!r}")
+        cleanup(img_duo, img_mch, backup, os.path.join(os.getcwd(), "0.img"))
+        return
+    rc2, out2, err2 = verona(["-p", platform_flag("mch"), "-d", img_mch, "-R", backup])
+    if rc2 == 0:
+        record("pass", "edge_cross_platform_restore_pinned: duo backup onto mch target succeeds (intentional, pinned)")
+    else:
+        record("genuine_failure", f"edge_cross_platform_restore_pinned: duo-onto-mch restore now rc={rc2} (was 0 -- behavior changed, update the pin deliberately if this is intended) err={err2!r}")
+    cleanup(img_duo, img_mch, backup, os.path.join(os.getcwd(), "0.img"))
+
+
+def edge_max_gpt_partition_count():
+    """A synthetic Monarch disk with the GPT partition array filled to
+    its practical maximum (128 entries, the standard default array
+    size) -- confirms the real on-disk GPT parser and boundary-
+    computation logic still work correctly at that scale: no off-by-
+    one at the array edge, correct boundary found for entries near the
+    end of a fully-populated table. (The array-edge math itself is
+    also covered directly, independent of any real fw-entry, by
+    TestNextBoundaryBytes_128EntryArray in pkg/verona/gpt_test.go.)"""
+    if not os.path.exists(GOLDEN_MCH_128PARTS):
+        record("expected_divergence", "edge_max_gpt_partition_count: GOLDEN_MCH_128PARTS image not present in this container -- skipping, not a verona-tool issue")
+        return
+    name = f"mch128-{random.randint(0, 1 << 30)}.img"
+    img = os.path.join(SCRATCH, name)
+    subprocess.run(["cp", "--sparse=always", GOLDEN_MCH_128PARTS, img], check=True)
+    n = fwcount(img, "mch")
+    candidates = writable_slots(img, "mch", n)
+    if not candidates:
+        cleanup(img)
+        return
+    slot, boundary = random.choice(candidates)
+    src = test_path("maxgpt", ".bin")
+    gen_random_file(src, random.randint(1, min(boundary, 1 << 16)))
+    rc, out, err = verona(["-p", platform_flag("mch"), "-d", img, "-w", f"{slot}{sep()}{src}"])
+    ok = True
+    if rc != 0:
+        record("genuine_failure", f"edge_max_gpt_partition_count slot={slot} rc={rc} err={err!r}")
+        ok = False
+    elif not verify_payload(img, "mch", slot, src, f"edge_max_gpt_partition_count slot={slot}"):
+        ok = False
+    if ok:
+        record("pass", f"edge_max_gpt_partition_count slot={slot}")
+    cleanup(img, src)
+
+
 EDGE_SCENARIOS_PLATFORMED = [
     edge_duplicate_write_direct, edge_duplicate_write_shortcut_collision,
     edge_dry_run_overflow, edge_dry_run_conflict, edge_restore_corrupted,
@@ -2127,10 +2336,13 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_idempotent_rewrite, edge_list_empty_entries, edge_same_path_read_then_write,
     edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
     edge_missing_required_params,
+    edge_exact_boundary_write, edge_cross_device_lock_independence,
+    edge_readonly_device, edge_backup_bitflip_corruption,
 ]
 EDGE_SCENARIOS_NOARG = [edge_help_version_combined, edge_gpt_no_fw_table, edge_fw_table_no_signature,
                          edge_doc_platform_aliases, edge_doc_exit_codes, edge_disk_full_read_output,
-                         edge_mch_deleted_partition_boundary]
+                         edge_mch_deleted_partition_boundary,
+                         edge_cross_platform_restore_pinned, edge_max_gpt_partition_count]
 
 
 def run_one_edge_iteration():

@@ -49,6 +49,41 @@ func TestNextBoundaryBytes_LastPartitionUsesGPTBackupReserve(t *testing.T) {
 	t.Logf("LAST_PART available size = %d bytes (a write of exactly this many bytes must succeed, one more byte must be refused)", available)
 }
 
+// At the standard default GPT array size (128 entries), confirm there's no
+// off-by-one at the array edge: a partition near the end (index 126 of 127)
+// must be bounded by the very last partition's start, and the actual last
+// partition (index 127) must fall through to the GPT backup reserve --
+// exactly like the small-scale case above, just at the real array size a
+// fully-populated disk would actually have.
+func TestNextBoundaryBytes_128EntryArray(t *testing.T) {
+	const n = 128
+	totalSectors := uint64(2_000_000)
+	parts := make([]GPTPartition, n)
+	for i := 0; i < n; i++ {
+		start := uint64(2048 + i*2048)
+		parts[i] = GPTPartition{Name: "FILLER", StartLBA: start, EndLBA: start + 2047}
+	}
+
+	// Second-to-last entry: bounded by the last entry's start.
+	got, err := NextBoundaryBytes(parts, totalSectors, parts[n-2].StartLBA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := parts[n-1].StartLBA * sectorSize; got != want {
+		t.Errorf("second-to-last of %d: got boundary %d, want %d", n, got, want)
+	}
+
+	// The actual last entry (index 127): bounded by the GPT backup reserve.
+	got, err = NextBoundaryBytes(parts, totalSectors, parts[n-1].StartLBA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := (totalSectors - GPTBackupReserveSectors) * sectorSize
+	if got != want {
+		t.Errorf("last of %d: got boundary %d, want %d", n, got, want)
+	}
+}
+
 func TestNextBoundaryBytes_DeviceTooSmallForReserve(t *testing.T) {
 	parts := []GPTPartition{{Name: "X", StartLBA: 10, EndLBA: 20}}
 	if _, err := NextBoundaryBytes(parts, GPTBackupReserveSectors, 10); err == nil {

@@ -1780,6 +1780,90 @@ def edge_missing_required_params(platform):
     cleanup(img)
 
 
+def edge_shortcut_requires_own_bare_flag(platform):
+    """Real inconsistency found by the user, with exact repro:
+
+      verona-tool --platform monarch --device /dev/sdb -r --rootfs --kernel
+        -> used to work: one bare -r "spread" across two shortcut
+           tokens with no -r repeated between them.
+      verona-tool --platform monarch --device /dev/sdb -r 8 9
+        -> already correctly errored: one -r with a numeric slot does
+           NOT spread to a second bare number (you'd have to write
+           "-r 8 -r 9").
+
+    The user's diagnosis: each -r/-w must correspond to exactly ONE
+    following argument -- a slot value for a valued -r/-w, or (for
+    the bare form) exactly one shortcut. A bare -r/-w now consumes
+    its one paired shortcut immediately, and a shortcut reached any
+    other way (not immediately preceded by a bare -r/-w that
+    consumed it) is itself a usage error -- including a second
+    shortcut following a first one with no -r/-w repeated in between.
+
+    This is specifically about shortcut pairing and does NOT change
+    the atomic-pair-boundary-check logic: that still runs once per
+    shortcut OCCURRENCE exactly as before (confirmed separately by
+    hand -- an oversized file for --dtb is still refused citing "part
+    of an atomic pair" either way this fix lands)."""
+    img = fresh(platform)
+    ok = True
+
+    def check(label, args, expect=1):
+        nonlocal ok
+        rc, out, err = verona(args)
+        if rc != expect:
+            record("genuine_failure", f"edge_shortcut_requires_own_bare_flag[{label}] platform={platform} rc={rc} (expected {expect}) err={err!r}")
+            ok = False
+
+    # The user's exact two example commands (device doesn't need to
+    # exist for the first -- the bug is that it used to pass argument
+    # parsing and reach open() at all; the second was already correct
+    # and is the baseline consistency target).
+    check("user_repro_one_r_two_shortcuts", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                              "-r", "--rootfs", "--kernel"])
+    check("baseline_one_r_two_numbers_still_errors", ["-p", platform_flag(platform), "-d", "/dev/sdb-does-not-exist",
+                                                        "-r", "8", "9"])
+
+    # The correct way to combine two shortcuts: repeat the bare flag
+    # before each one. Must succeed, producing all 4 files.
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--rootfs", "-r", "--kernel"])
+    if rc != 0:
+        record("genuine_failure", f"edge_shortcut_requires_own_bare_flag[repeated_r_before_each_shortcut] platform={platform} rc={rc} err={err!r}")
+        ok = False
+    else:
+        for fname in ("5.img", "8.img", "9.img", "12.img"):
+            p = os.path.join(os.getcwd(), fname)
+            if not os.path.exists(p):
+                record("genuine_failure", f"edge_shortcut_requires_own_bare_flag[repeated_r_before_each_shortcut] platform={platform}: {fname} not produced")
+                ok = False
+    cleanup(os.path.join(os.getcwd(), "5.img"), os.path.join(os.getcwd(), "8.img"),
+            os.path.join(os.getcwd(), "9.img"), os.path.join(os.getcwd(), "12.img"))
+
+    # -r 8 -r 9 (two separate valued reads) must keep working exactly
+    # as before -- the unaffected baseline.
+    check("two_separate_valued_reads", ["-p", platform_flag(platform), "-d", img, "-r", "8", "-r", "9"], expect=0)
+    cleanup(os.path.join(os.getcwd(), "8.img"), os.path.join(os.getcwd(), "9.img"))
+
+    # Double-check from the coordinator: the same rule applies to -w
+    # with write-mode shortcuts (each needs its own attached "=value"
+    # AND its own preceding bare -w -- one bare -w must not "cover" a
+    # second shortcut either).
+    src_a = test_path("shortcutpair_a", ".bin")
+    src_b = test_path("shortcutpair_b", ".bin")
+    gen_random_file(src_a, 1024)
+    gen_random_file(src_b, 1024)
+    check("one_bare_w_two_write_shortcuts_errors", ["-p", platform_flag(platform), "-d", img,
+                                                     "-w", f"--kernel={src_a}", f"--rootfs={src_b}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"--kernel={src_a}", "-w", f"--rootfs={src_b}"])
+    if rc != 0:
+        record("genuine_failure", f"edge_shortcut_requires_own_bare_flag[repeated_w_before_each_write_shortcut] platform={platform} rc={rc} err={err!r}")
+        ok = False
+    cleanup(src_a, src_b)
+
+    if ok:
+        record("pass", f"edge_shortcut_requires_own_bare_flag platform={platform}")
+    cleanup(img)
+
+
 def edge_long_form_space_separated_value(platform):
     """Real bug found by the user: --read/--write (long form) only ever
     accepted an attached "=value" (--read=2), never a space-separated
@@ -1915,14 +1999,15 @@ def edge_bare_flag_without_shortcut(platform):
         ok = False
     cleanup(os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
 
-    # Legitimate: exactly ONE bare -r immediately followed by multiple
-    # shortcuts must still succeed.
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-r", "--kernel", "--dtb"])
-    if rc != 0:
-        record("genuine_failure", f"edge_bare_flag_without_shortcut[legit_one_bare_r_multi_shortcut] platform={platform} rc={rc} err={err!r}")
-        ok = False
-    cleanup(os.path.join(os.getcwd(), "5.img"), os.path.join(os.getcwd(), "12.img"),
-            os.path.join(os.getcwd(), "6.img"), os.path.join(os.getcwd(), "7.img"))
+    # Round 3 (the user's most recent correction, superseding this
+    # test's own earlier assumption): one bare -r does NOT "spread"
+    # across multiple shortcut tokens -- it pairs with and consumes
+    # exactly ONE, the same one-value-per-occurrence rule a valued -r
+    # follows for its own SLOT[:FILE]. "-r --kernel --dtb" (no -r
+    # repeated between the two shortcuts) is now itself a usage error;
+    # see edge_shortcut_requires_own_bare_flag for the full coverage of
+    # this round, including the correct "-r --kernel -r --dtb" form.
+    check("one_bare_r_no_longer_spreads_across_shortcuts", ["-p", platform_flag(platform), "-d", img, "-r", "--kernel", "--dtb"])
 
     n = fwcount(img, platform)
     candidates = writable_slots(img, platform, n)
@@ -2503,7 +2588,7 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_idempotent_rewrite, edge_list_empty_entries, edge_same_path_read_then_write,
     edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
     edge_missing_required_params, edge_bare_flag_without_shortcut,
-    edge_long_form_space_separated_value,
+    edge_long_form_space_separated_value, edge_shortcut_requires_own_bare_flag,
     edge_exact_boundary_write, edge_cross_device_lock_independence,
     edge_readonly_device, edge_backup_bitflip_corruption,
 ]

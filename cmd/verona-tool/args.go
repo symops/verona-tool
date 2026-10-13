@@ -123,18 +123,8 @@ func parseArgs(argv []string) (*args, error) {
 
 	for i := 0; i < len(argv); i++ {
 		tok := argv[i]
-		var name, attached string
-		hasAttached := false
-		if strings.HasPrefix(tok, "--") {
-			body := tok[2:]
-			if eq := strings.IndexByte(body, '='); eq != -1 {
-				name, attached, hasAttached = body[:eq], body[eq+1:], true
-			} else {
-				name = body
-			}
-		} else if strings.HasPrefix(tok, "-") && len(tok) > 1 {
-			name = tok[1:]
-		} else {
+		name, attached, hasAttached, ok := parseFlagToken(tok)
+		if !ok {
 			return nil, fmt.Errorf("unexpected argument %q", tok)
 		}
 
@@ -225,16 +215,21 @@ func parseArgs(argv []string) (*args, error) {
 				a.reads = append(a.reads, slotFile{slot, file})
 			} else {
 				// bare -r/--read: no slot given here -- valid only when
-				// immediately followed by a -k/-t/-f shortcut, which
-				// supplies the actual slot(s); that's the real-world
-				// pattern every legitimate "-r --kernel" invocation
-				// uses. NOT immediately followed by a shortcut means
-				// this occurrence is dangling and a usage error (this
-				// does NOT apply to valued -r, e.g. "-r 5:file", which
-				// remains legitimately repeatable, including appearing
-				// more than once).
+				// immediately followed by a -k/-t/-f shortcut, which it
+				// then pairs with and consumes (exactly one, the same
+				// one-value-per-occurrence rule a valued -r follows for
+				// its own SLOT[:FILE] -- "-r --kernel --dtb" is NOT one
+				// -r covering both; each needs its own: "-r --kernel
+				// -r --dtb"). NOT immediately followed by a shortcut
+				// means this occurrence is dangling and a usage error
+				// (this does NOT apply to valued -r, e.g. "-r 5:file",
+				// which remains legitimately repeatable, including
+				// appearing more than once).
 				if !nextIsShortcut(argv, i) {
 					return nil, fmt.Errorf("-r/--read with no slot must be immediately followed by a -k/-t/-f shortcut")
+				}
+				if err := a.consumeShortcut(argv, &i); err != nil {
+					return nil, err
 				}
 			}
 		case "w", "write":
@@ -265,28 +260,27 @@ func parseArgs(argv []string) (*args, error) {
 			} else {
 				// bare -w/--write: no SLOT:FILE given here -- valid
 				// only when immediately followed by a -k/-t/-f
-				// shortcut (its write-mode "=FILE" attachment
-				// supplies the actual slot(s) and file); same
-				// reasoning as bare -r above. Not immediately
-				// followed by a shortcut means this occurrence is
-				// dangling and a usage error (valued -w, e.g.
-				// "-w 5:file", remains legitimately repeatable).
+				// shortcut, which it then pairs with and consumes
+				// (its write-mode "=FILE" attachment supplies the
+				// actual slot(s) and file); same one-value-per-
+				// occurrence reasoning as bare -r above. Not
+				// immediately followed by a shortcut means this
+				// occurrence is dangling and a usage error (valued
+				// -w, e.g. "-w 5:file", remains legitimately
+				// repeatable).
 				if !nextIsShortcut(argv, i) {
 					return nil, fmt.Errorf("-w/--write with no SLOT:FILE must be immediately followed by a -k/-t/-f shortcut")
 				}
+				if err := a.consumeShortcut(argv, &i); err != nil {
+					return nil, err
+				}
 			}
 		case "k", "kernel":
-			if err := a.addShortcut(shortcutKernel, hasAttached, attached); err != nil {
-				return nil, err
-			}
+			return nil, fmt.Errorf("-k/--kernel must be immediately preceded by a bare -r or -w in the same invocation")
 		case "t", "dtb":
-			if err := a.addShortcut(shortcutDTB, hasAttached, attached); err != nil {
-				return nil, err
-			}
+			return nil, fmt.Errorf("-t/--dtb must be immediately preceded by a bare -r or -w in the same invocation")
 		case "f", "rootfs":
-			if err := a.addShortcut(shortcutRootFS, hasAttached, attached); err != nil {
-				return nil, err
-			}
+			return nil, fmt.Errorf("-f/--rootfs must be immediately preceded by a bare -r or -w in the same invocation")
 		default:
 			return nil, fmt.Errorf("unknown flag %q", tok)
 		}
@@ -335,20 +329,58 @@ func flagName(tok string) string {
 	return ""
 }
 
+// shortcutFromName maps a flag's canonical name (as returned by
+// flagName) to its shortcut, if it is one.
+func shortcutFromName(name string) (shortcut, bool) {
+	switch name {
+	case "k", "kernel":
+		return shortcutKernel, true
+	case "t", "dtb":
+		return shortcutDTB, true
+	case "f", "rootfs":
+		return shortcutRootFS, true
+	}
+	return shortcutNone, false
+}
+
 // nextIsShortcut reports whether argv[i+1] is one of the -k/-t/-f
-// shortcut flags (short or long form). A bare -r/-w immediately
-// followed by a shortcut IS giving that occurrence meaning (the
-// shortcut supplies the slot(s)) -- this is the real-world pattern
-// every legitimate "-r --kernel"/"-w --kernel=file" invocation uses,
-// and the basis for distinguishing a satisfied bare -r/-w from a
-// genuinely dangling one.
+// shortcut flags (short or long form).
 func nextIsShortcut(argv []string, i int) bool {
 	if i+1 >= len(argv) {
 		return false
 	}
-	switch flagName(argv[i+1]) {
-	case "k", "kernel", "t", "dtb", "f", "rootfs":
-		return true
+	_, ok := shortcutFromName(flagName(argv[i+1]))
+	return ok
+}
+
+// consumeShortcut parses argv[i+1] (already confirmed to be a shortcut
+// by nextIsShortcut) and registers it, advancing i past it. A bare
+// -r/-w pairs with EXACTLY ONE following shortcut this way -- the same
+// one-value-per-occurrence rule a valued -r/-w already follows for its
+// own SLOT[:FILE] -- so "-r --kernel --dtb" (one bare -r, two shortcut
+// tokens with no -r repeated between them) is no longer accepted as
+// "spreading" across both; each shortcut needs its own preceding bare
+// -r/-w ("-r --kernel -r --dtb").
+func (a *args) consumeShortcut(argv []string, i *int) error {
+	*i++
+	name, attached, hasAttached, _ := parseFlagToken(argv[*i])
+	s, _ := shortcutFromName(name)
+	return a.addShortcut(s, hasAttached, attached)
+}
+
+// parseFlagToken splits a "-x", "--long" or "--long=value" token into
+// its canonical name and optional attached value. ok is false for a
+// token that isn't a flag at all (doesn't start with "-").
+func parseFlagToken(tok string) (name, attached string, hasAttached bool, ok bool) {
+	if strings.HasPrefix(tok, "--") {
+		body := tok[2:]
+		if eq := strings.IndexByte(body, '='); eq != -1 {
+			return body[:eq], body[eq+1:], true, true
+		}
+		return body, "", false, true
 	}
-	return false
+	if strings.HasPrefix(tok, "-") && len(tok) > 1 {
+		return tok[1:], "", false, true
+	}
+	return "", "", false, false
 }

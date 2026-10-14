@@ -1057,7 +1057,9 @@ def scenario_shortcut_write(platform):
     before = sha256(img)
 
     # FILE attaches as --name=FILE, -x=FILE or -x:FILE (all equivalent).
-    arg = random.choice([f"{flag_long}={src}", f"{flag_short}={src}", f"{flag_short}:{src}"])
+    form, arg = random.choice([("long=", f"{flag_long}={src}"),
+                               ("short=", f"{flag_short}={src}"),
+                               ("short:", f"{flag_short}:{src}")])
     rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", arg])
     after = sha256(img)
 
@@ -1089,7 +1091,7 @@ def scenario_shortcut_write(platform):
             record("genuine_failure", f"shortcut_write normal platform={platform} name={name} slot={slot}: written content/length mismatch")
             ok = False
     if ok:
-        record("pass", f"shortcut_write normal platform={platform} name={name} flag={flag} size={size}")
+        record("pass", f"shortcut_write normal platform={platform} name={name} form={form} size={size}")
     cleanup(img, src)
 
 

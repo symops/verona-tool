@@ -54,6 +54,106 @@ verona-tool -p mch -d /dev/sda -l                 # check the result
 confirmed.** Back up first, try the exact command with `-n` and against
 a copy of the image, and double-check `-d` before writing to hardware.
 
+## Command-line reference
+
+```
+verona-tool -p PLATFORM [-d DEVICE] [-r SLOT[:FILE]]... [-w SLOT:FILE]... [options]
+verona-tool -p PLATFORM [-d DEVICE] -B [FILE] [-r ...] [-w ...]
+verona-tool -p PLATFORM [-d DEVICE] -l
+verona-tool -p PLATFORM [-d DEVICE] -R FILE
+verona-tool -h | --help
+verona-tool -v | --version
+```
+
+At least one of `-r`, `-w`, `-B`, `-l`, `-R` is required (unless `-h` or
+`-v` is given). A value may be attached to its option with `=` for the
+long options (`--device=/dev/sda`); a slot/file pair accepts `:` or `=`
+between the two (`3:file.img` or `3=file.img`).
+
+### Selecting the unit
+
+| Option | Meaning |
+|---|---|
+| `-p`, `--platform VALUE` | **Required.** `m`, `monarch`, `mch`, `home` = WD My Cloud Home (single-bay, RTD1295); `p`, `pelican`, `mchd`, `duo` = My Cloud Home Duo (dual-bay, RTD1296). |
+| `-d`, `--device PATH` | The block device **or a plain image file** that holds the VERONA table. **Required for Monarch** (pass the whole disk, e.g. `/dev/sda`: the table's partition is found through the GPT); optional for Duo (default `/dev/mmcblk0`, the table sits at a fixed offset). |
+
+### Reading and writing slots
+
+| Option | Meaning |
+|---|---|
+| `-r`, `--read SLOT[:FILE]` | Dump the current contents of table entry `SLOT` to `FILE`. `FILE` may be omitted and defaults to `./SLOT.img`. Repeatable. Reading an empty slot (length 0) silently produces an empty file. |
+| `-w`, `--write SLOT:FILE` | Write `FILE` into table entry `SLOT` and recalculate its checksum. `FILE` is required. Exactly the file's own bytes are written, nothing beyond is touched or zero-filled. Refused (nothing written, exit 3) if `FILE` is larger than the slot's boundary. Repeatable. Only the entry's length, padding and checksum change in the table; its type, version and load address are never touched. |
+| `-k`, `--kernel` | Shortcut for the kernel pair: slots `5` (Kernel) and `12` (RescueKernel). |
+| `-t`, `--dtb` | Shortcut for the device-tree pair: slots `7` (KernelDeviceTree) and `6` (RescueDeviceTree). |
+| `-f`, `--rootfs` | Shortcut for the rootfs pair: slots `9` (KernelRootFS) and `8` (RescueRootFS). |
+
+Each shortcut must be **immediately preceded by its own bare `-r` or
+`-w`**, which selects the mode (otherwise it is a usage error:
+`-t/--dtb must be immediately preceded by a bare -r or -w`):
+
+- **Read mode** (`-r -k`): no value; both slots are dumped to files named
+  after their own slot numbers (`5.img`, `12.img`).
+- **Write mode** (`-w -k=FILE`): the file is attached to the option as
+  `--kernel=FILE`, `-k=FILE` or `-k:FILE` (same for `-t`/`--dtb` and
+  `-f`/`--rootfs`). A space-separated value is not accepted. The same
+  file is written into both slots, and only if it fits **both**
+  boundaries; otherwise neither slot is touched. All other short options
+  reject an attached `-x=VALUE`.
+
+```sh
+verona-tool -p duo -r -k -r -t                                # dump 5, 12, 7, 6
+verona-tool -p duo -w -k=emmc.uImage -w -t:rescue.emmc.dtb    # flash two pairs
+```
+
+### Whole-table operations
+
+| Option | Meaning |
+|---|---|
+| `-B`, `--backup [FILE]` | Save the whole table region to `FILE` before anything else in this run (default `verona-table-backup-<platform>-<YYYYMMDDHHMMSS>.img`). It always runs first, even if a later `-r`/`-w` of the same command fails. Combines with `-r`, `-w`, `-k`, `-t`, `-f`; not with `-l` or `-R`. |
+| `-R`, `--restore FILE` | Validate `FILE` (signature, checksum, size, alignment, and that it fits the space available on `-d`) and, only if valid, write it back over the table. **Exclusive:** cannot be combined with anything else, `-B` included. |
+| `-l`, `--list` | Print the full table (header, partitions, firmware entries) and exit. **Exclusive.** |
+
+### Modifiers and information
+
+| Option | Meaning |
+|---|---|
+| `-n`, `--dry-run` | Print what would be read or written and which checks would pass or fail, without writing anything (and without creating backup or output files). Combines with everything; on its own it is a usage error. Exits 0 whenever the simulation itself completed, even if it reports that the real run would fail. |
+| `-D`, `--debug` | Print extra diagnostics (where the table was found, computed boundaries, lock state, byte offsets, checksums) next to the normal output. Changes nothing about what is done. |
+| `-h`, `--help` | Show the built-in help and exit. Must be used alone. |
+| `-v`, `--version` | Show the version and the author and exit. Must be used alone. |
+
+### How a run is processed
+
+- **Order** is fixed and independent of the order on the command line:
+  `-B` first, then every `-r`, then every `-w`. The table checksum is
+  recalculated **once**, after all writes. If there is no `-w`, the
+  table is never rewritten.
+- **Conflicts** (exit 5): the same slot written twice (also through the
+  shortcuts), the same shortcut given twice in write mode, an explicit
+  `-w N` whose slot `N` also belongs to a shortcut written in the same
+  command. The same output path used by several `-r`/`-B` is only a
+  warning.
+- **Verification:** after every data write and every table write
+  (`-R` included) the written range is read back and compared with the
+  source; a mismatch is exit 6 and is not retried. Every write is
+  `fsync`ed.
+- **Locking:** the device is `flock`ed non-blockingly for the whole run,
+  shared for read-only commands and exclusive when anything is written. A
+  device that is already locked fails at once with exit 7.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | argument or usage error |
+| 2 | bad signature, corrupt table, or invalid backup file |
+| 3 | file too large for the destination slot: refused |
+| 4 | slot index out of range |
+| 5 | argument conflict |
+| 6 | verification after writing did not match |
+| 7 | device locked by another process |
+
 ## Build
 
 The target runtime -- the rescue/recovery environment on both Monarch

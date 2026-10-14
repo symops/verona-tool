@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 import hashlib
+import shutil
+import stat
 import traceback
 import signal
 
@@ -1027,12 +1029,10 @@ def scenario_shortcut_write(platform):
         src = test_path("dupe", ".bin")
         gen_random_file(src, 64)
         before = sha256(img)
-        # Write-mode shortcuts only accept the '=FILE' attachment on the
-        # long option form (per SPEC.md); the short forms (-k/-t/-o) carry
-        # no value in write mode. Using the long form twice is still a
-        # valid way to exercise the duplicate-shortcut conflict check.
-        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w",
-                                f"{flag_long}={src}", "-w", f"{flag_long}={src}"])
+        # Any of the three FILE spellings (--name=FILE, -x=FILE, -x:FILE)
+        # is a valid way to exercise the duplicate-shortcut conflict check.
+        spell = lambda: random.choice([f"{flag_long}={src}", f"{flag_short}={src}", f"{flag_short}:{src}"])
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", spell(), "-w", spell()])
         after = sha256(img)
         if rc == 5 and before == after:
             record("pass", f"shortcut_write duplicate_conflict platform={platform} name={name}")
@@ -1056,9 +1056,11 @@ def scenario_shortcut_write(platform):
     gen_random_file(src, size)
     before = sha256(img)
 
-    # Write-mode shortcuts only accept '=FILE' on the long option form.
-    flag = flag_long
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{flag}={src}"])
+    # FILE attaches as --name=FILE, -x=FILE or -x:FILE (all equivalent).
+    form, arg = random.choice([("long=", f"{flag_long}={src}"),
+                               ("short=", f"{flag_short}={src}"),
+                               ("short:", f"{flag_short}:{src}")])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", arg])
     after = sha256(img)
 
     if mode == "oversized_half":
@@ -1089,7 +1091,7 @@ def scenario_shortcut_write(platform):
             record("genuine_failure", f"shortcut_write normal platform={platform} name={name} slot={slot}: written content/length mismatch")
             ok = False
     if ok:
-        record("pass", f"shortcut_write normal platform={platform} name={name} flag={flag} size={size}")
+        record("pass", f"shortcut_write normal platform={platform} name={name} form={form} size={size}")
     cleanup(img, src)
 
 
@@ -1920,6 +1922,69 @@ def edge_long_form_space_separated_value(platform):
     cleanup(img)
 
 
+def edge_short_shortcut_attached_value(platform):
+    """-k/-t/-f accept an attached FILE as -x=FILE and -x:FILE, exactly
+    like --kernel/--dtb/--rootfs=FILE (user request: previously only the
+    long form could carry the write-mode FILE, so "-w -t=file" was
+    rejected with a misleading "must be followed by a shortcut" error).
+    Writes the same payload into identical copies of one image using the
+    three spellings and requires byte-identical results; then checks the
+    guard rails still hold (a bare -x=FILE without its own -w/-r, one -w
+    covering two shortcuts, and every other short flag still rejecting
+    -x=VALUE)."""
+    img = fresh(platform)
+    name = random.choice(list(SHORTCUT_SLOTS))
+    flag_long = f"--{name}"
+    flag_short = {"kernel": "-k", "dtb": "-t", "rootfs": "-f"}[name]
+    slots = SHORTCUT_SLOTS[name]
+    other_short = random.choice([x for x in ("-k", "-t", "-f") if x != flag_short])
+    ok = True
+
+    b0 = duo_boundary(img, slots[0]) if platform == "duo" else monarch_boundary(img, slots[0])
+    b1 = duo_boundary(img, slots[1]) if platform == "duo" else monarch_boundary(img, slots[1])
+    min_b = min(b0, b1)
+    if min_b >= 16 and min_b <= MAX_PRACTICAL_BOUNDARY:
+        src = test_path("sshort", ".bin")
+        gen_random_file(src, random.randint(1, min(min_b, 1 << 16)))
+        results = {}
+        for label, arg in (("long", f"{flag_long}={src}"),
+                           ("short_eq", f"{flag_short}={src}"),
+                           ("short_colon", f"{flag_short}:{src}")):
+            copy = test_path("sshortimg", ".img")
+            shutil.copyfile(img, copy)
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", copy, "-w", arg])
+            if rc != 0:
+                record("genuine_failure", f"edge_short_shortcut_attached_value[{label}] platform={platform} name={name} rc={rc} err={err!r}")
+                ok = False
+            results[label] = sha256(copy)
+            for slot in slots:
+                if not verify_payload(copy, platform, slot, src, f"edge_short_shortcut_attached_value[{label}] platform={platform} slot={slot}"):
+                    ok = False
+            cleanup(copy)
+        if len(set(results.values())) != 1:
+            record("genuine_failure", f"edge_short_shortcut_attached_value platform={platform} name={name}: spellings produced different images {results}")
+            ok = False
+        cleanup(src)
+
+    base = ["-p", platform_flag(platform), "-d", img]
+    for label, extra in (
+        ("bare_short_eq_no_flag", [f"{flag_short}=x"]),
+        ("bare_short_colon_no_flag", [f"{flag_short}:x"]),
+        ("one_w_two_shortcuts", ["-w", f"{flag_short}=x", f"{other_short}=y"]),
+        ("valued_w_not_bare", ["-w", "5:x", f"{flag_short}=x"]),
+        ("other_short_flag_eq", ["-p=duo"]),
+        ("other_short_flag_colon", ["-d:/dev/null"]),
+    ):
+        rc, out, err = verona(base + extra) if label not in ("other_short_flag_eq", "other_short_flag_colon") else verona(extra)
+        if rc != 1:
+            record("genuine_failure", f"edge_short_shortcut_attached_value[{label}] platform={platform} rc={rc} (expected 1) err={err!r}")
+            ok = False
+
+    if ok:
+        record("pass", f"edge_short_shortcut_attached_value platform={platform} name={name}")
+    cleanup(img)
+
+
 def edge_bare_flag_without_shortcut(platform):
     """Real bug found by the user, fixed in two rounds:
 
@@ -2598,6 +2663,7 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
     edge_missing_required_params, edge_bare_flag_without_shortcut,
     edge_long_form_space_separated_value, edge_shortcut_requires_own_bare_flag,
+    edge_short_shortcut_attached_value,
     edge_exact_boundary_write, edge_cross_device_lock_independence,
     edge_readonly_device, edge_backup_bitflip_corruption,
 ]
@@ -2615,6 +2681,83 @@ def run_one_edge_iteration():
         random.choice(EDGE_SCENARIOS_PLATFORMED)(platform)
 
 
+# --- scratch housekeeping -------------------------------------------------
+# A scenario that is interrupted (kill-mid-write, timeouts, an exception, a
+# crashed run) leaves its multi-GB scratch image behind, and nothing ever
+# removed them: after a few long runs "/" filled up and a run died with
+# ENOSPC (not a verona-tool problem). So: clear the scratch dir when a run
+# starts, reap anything stale while it runs, and stop cleanly -- instead of
+# reporting bogus failures -- if the disk is nearly full anyway. The golden
+# images live outside SCRATCH and are never touched.
+SCRATCH_STALE_SECONDS = 30 * 60
+SCRATCH_LOW_FREE_BYTES = 12 << 30
+SCRATCH_ABORT_FREE_BYTES = 3 << 30
+
+
+def _other_driver_running():
+    me = os.getpid()
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ")
+        except OSError:
+            continue
+        if b"autotest_driver.py" in cmd and b"python" in cmd:
+            return True
+    return False
+
+
+def _tree_bytes(path):
+    total = 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def reap_scratch(max_age, why):
+    """Delete entries of SCRATCH older than max_age seconds (every entry if
+    max_age is None). Returns (entries_removed, bytes_freed)."""
+    real = os.path.realpath(SCRATCH)
+    if real != "/root/work/scratch":
+        log(f"scratch cleanup refused: {SCRATCH} resolves to {real}")
+        return 0, 0
+    now = time.time()
+    removed = freed = 0
+    for name in os.listdir(real):
+        path = os.path.join(real, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if max_age is not None and now - st.st_mtime < max_age:
+            continue
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                size = _tree_bytes(path)
+                shutil.rmtree(path)
+            else:
+                size = st.st_blocks * 512
+                os.unlink(path)
+        except OSError as e:
+            log(f"scratch cleanup: could not remove {path}: {e!r}")
+            continue
+        removed += 1
+        freed += size
+    if removed:
+        log(f"scratch cleanup ({why}): removed {removed} entries, freed {freed / (1 << 30):.1f} GiB")
+    return removed, freed
+
+
+def scratch_free_bytes():
+    return shutil.disk_usage(SCRATCH).free
+
+
 def main():
     duration = int(sys.argv[1]) if len(sys.argv) > 1 else 3600
     # mode: "classic" (original randomized scenarios only, the default,
@@ -2624,10 +2767,20 @@ def main():
     mode = sys.argv[2] if len(sys.argv) > 2 else "classic"
     deadline = time.time() + duration
     os.chdir(SCRATCH)
+    if _other_driver_running():
+        log("another autotest_driver.py is running: leaving the scratch dir alone")
+    else:
+        reap_scratch(None, "startup")
     log(f"autotest starting, running for {duration} seconds, mode={mode}")
     i = 0
     while time.time() < deadline:
         i += 1
+        if i % 25 == 0 or scratch_free_bytes() < SCRATCH_LOW_FREE_BYTES:
+            reap_scratch(SCRATCH_STALE_SECONDS, f"iteration {i}")
+            free = scratch_free_bytes()
+            if free < SCRATCH_ABORT_FREE_BYTES:
+                log(f"ABORTING: only {free / (1 << 30):.1f} GiB free after cleanup -- stopping instead of reporting ENOSPC as failures")
+                break
         try:
             if mode == "edge":
                 run_one_edge_iteration()

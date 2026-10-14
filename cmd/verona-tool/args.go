@@ -312,10 +312,34 @@ func looksLikeFlag(tok string) bool {
 	return strings.HasPrefix(tok, "-")
 }
 
+// splitShortShortcutValue recognises the short spellings of a shortcut's
+// attached write-mode FILE: "-k=FILE" / "-k:FILE" (and -t, -f), exactly
+// equivalent to "--kernel=FILE" etc. Only the three shortcut letters take
+// a value this way; any other short flag keeps its usual grammar. The
+// value is everything after the first '=' or ':' (it may itself contain
+// either character).
+func splitShortShortcutValue(tok string) (name, value string, ok bool) {
+	if len(tok) < 3 || tok[0] != '-' || tok[1] == '-' {
+		return "", "", false
+	}
+	switch tok[1] {
+	case 'k', 't', 'f':
+	default:
+		return "", "", false
+	}
+	if tok[2] != '=' && tok[2] != ':' {
+		return "", "", false
+	}
+	return tok[1:2], tok[3:], true
+}
+
 // flagName extracts the canonical name from a "-x", "--long" or
 // "--long=value" token, stripping any attached value. Returns "" for a
 // token that isn't a flag at all.
 func flagName(tok string) string {
+	if name, _, ok := splitShortShortcutValue(tok); ok {
+		return name
+	}
 	if strings.HasPrefix(tok, "--") {
 		body := tok[2:]
 		if eq := strings.IndexByte(body, '='); eq != -1 {
@@ -372,6 +396,9 @@ func (a *args) consumeShortcut(argv []string, i *int) error {
 // its canonical name and optional attached value. ok is false for a
 // token that isn't a flag at all (doesn't start with "-").
 func parseFlagToken(tok string) (name, attached string, hasAttached bool, ok bool) {
+	if n, v, isShort := splitShortShortcutValue(tok); isShort {
+		return n, v, true, true
+	}
 	if strings.HasPrefix(tok, "--") {
 		body := tok[2:]
 		if eq := strings.IndexByte(body, '='); eq != -1 {

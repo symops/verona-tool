@@ -13,7 +13,7 @@ sudo apt install -y \
     gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 ```
 
-Go 1.25 or newer is required (`go.mod`); Debian 13's `golang-go` satisfies it. Check with `go version`.
+Go 1.24 or newer is required (`go.mod`); Debian 13's `golang-go` (Go 1.24) satisfies it, so no extra toolchain is downloaded. Check with `go version`.
 
 `gcc-aarch64-linux-gnu` is needed even though this is a Go project with no C source of its own: `make build` cross-compiles with `CGO_ENABLED=1` specifically to get a **dynamically linked** binary (see step 3), and `cgo` needs a working C cross-compiler on the host for that. `binutils-aarch64-linux-gnu` provides `aarch64-linux-gnu-strip` and `aarch64-linux-gnu-readelf`, used by `make strip` and `make verify-deps`.
 

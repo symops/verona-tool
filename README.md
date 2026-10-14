@@ -45,7 +45,7 @@ verona-tool -p mch -d /dev/sda -l                 # check the result
   `--kernel=FILE`, `-k=FILE` or `-k:FILE`; the same file goes into
   both slots, and only if it fits both.
 - `-n` prints what would be done (and which checks would pass) without
-  writing; `-B [FILE]` saves the table first; `-R FILE` restores it.
+  writing; `-B [FILE]` (long form `--backup=FILE`) saves the table first; `-R FILE` restores it.
 - Exit codes tell failures apart (`3` file too large for the slot,
   `6` post-write verification mismatch, `7` device locked by another
   process, ...); the full table is in `SPEC.md`.
@@ -58,7 +58,7 @@ a copy of the image, and double-check `-d` before writing to hardware.
 
 ```
 verona-tool -p PLATFORM [-d DEVICE] [-r SLOT[:FILE]]... [-w SLOT:FILE]... [options]
-verona-tool -p PLATFORM [-d DEVICE] -B [FILE] [-r ...] [-w ...]
+verona-tool -p PLATFORM [-d DEVICE] -B [FILE] [-r ...] [-w ...]   # long form: --backup[=FILE]
 verona-tool -p PLATFORM [-d DEVICE] -l
 verona-tool -p PLATFORM [-d DEVICE] -R FILE
 verona-tool -h | --help
@@ -109,9 +109,21 @@ verona-tool -p duo -w -k=emmc.uImage -w -t:rescue.emmc.dtb    # flash two pairs
 
 | Option | Meaning |
 |---|---|
-| `-B`, `--backup [FILE]` | Save the whole table region to `FILE` before anything else in this run (default `verona-table-backup-<platform>-<YYYYMMDDHHMMSS>.img`). It always runs first, even if a later `-r`/`-w` of the same command fails. Combines with `-r`, `-w`, `-k`, `-t`, `-f`; not with `-l` or `-R`. |
+| `-B [FILE]`, `--backup[=FILE]` | Save the whole table region to `FILE` before anything else in this run (default `verona-table-backup-<platform>-<YYYYMMDDHHMMSS>.img`). It always runs first, even if a later `-r`/`-w` of the same command fails. Combines with `-r`, `-w`, `-k`, `-t`, `-f`; not with `-l` or `-R`. |
 | `-R`, `--restore FILE` | Validate `FILE` (signature, checksum, size, alignment, and that it fits the space available on `-d`) and, only if valid, write it back over the table. **Exclusive:** cannot be combined with anything else, `-B` included. |
 | `-l`, `--list` | Print the full table (header, partitions, firmware entries) and exit. **Exclusive.** |
+
+The value of `-B`/`--backup` is optional, so it is written differently in
+the two spellings: the short form takes it as the next word (`-B FILE`),
+the long form only **attached with `=`** (`--backup=FILE`). `--backup FILE`
+(with a space) is rejected as an unexpected argument. `--restore FILE` and
+the other options with a required value accept either form.
+
+```sh
+verona-tool -p duo -B table.img -w -k=emmc.uImage                # short form
+verona-tool --platform duo --backup=table.img --write --kernel=emmc.uImage   # long form
+verona-tool -p duo -B -w -k=emmc.uImage                          # no FILE: default name
+```
 
 ### Modifiers and information
 

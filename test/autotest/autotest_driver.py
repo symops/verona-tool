@@ -11,6 +11,7 @@ import sys
 import time
 import hashlib
 import shutil
+import stat
 import traceback
 import signal
 
@@ -2678,6 +2679,83 @@ def run_one_edge_iteration():
         random.choice(EDGE_SCENARIOS_PLATFORMED)(platform)
 
 
+# --- scratch housekeeping -------------------------------------------------
+# A scenario that is interrupted (kill-mid-write, timeouts, an exception, a
+# crashed run) leaves its multi-GB scratch image behind, and nothing ever
+# removed them: after a few long runs "/" filled up and a run died with
+# ENOSPC (not a verona-tool problem). So: clear the scratch dir when a run
+# starts, reap anything stale while it runs, and stop cleanly -- instead of
+# reporting bogus failures -- if the disk is nearly full anyway. The golden
+# images live outside SCRATCH and are never touched.
+SCRATCH_STALE_SECONDS = 30 * 60
+SCRATCH_LOW_FREE_BYTES = 12 << 30
+SCRATCH_ABORT_FREE_BYTES = 3 << 30
+
+
+def _other_driver_running():
+    me = os.getpid()
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ")
+        except OSError:
+            continue
+        if b"autotest_driver.py" in cmd and b"python" in cmd:
+            return True
+    return False
+
+
+def _tree_bytes(path):
+    total = 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def reap_scratch(max_age, why):
+    """Delete entries of SCRATCH older than max_age seconds (every entry if
+    max_age is None). Returns (entries_removed, bytes_freed)."""
+    real = os.path.realpath(SCRATCH)
+    if real != "/root/work/scratch":
+        log(f"scratch cleanup refused: {SCRATCH} resolves to {real}")
+        return 0, 0
+    now = time.time()
+    removed = freed = 0
+    for name in os.listdir(real):
+        path = os.path.join(real, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if max_age is not None and now - st.st_mtime < max_age:
+            continue
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                size = _tree_bytes(path)
+                shutil.rmtree(path)
+            else:
+                size = st.st_blocks * 512
+                os.unlink(path)
+        except OSError as e:
+            log(f"scratch cleanup: could not remove {path}: {e!r}")
+            continue
+        removed += 1
+        freed += size
+    if removed:
+        log(f"scratch cleanup ({why}): removed {removed} entries, freed {freed / (1 << 30):.1f} GiB")
+    return removed, freed
+
+
+def scratch_free_bytes():
+    return shutil.disk_usage(SCRATCH).free
+
+
 def main():
     duration = int(sys.argv[1]) if len(sys.argv) > 1 else 3600
     # mode: "classic" (original randomized scenarios only, the default,
@@ -2687,10 +2765,20 @@ def main():
     mode = sys.argv[2] if len(sys.argv) > 2 else "classic"
     deadline = time.time() + duration
     os.chdir(SCRATCH)
+    if _other_driver_running():
+        log("another autotest_driver.py is running: leaving the scratch dir alone")
+    else:
+        reap_scratch(None, "startup")
     log(f"autotest starting, running for {duration} seconds, mode={mode}")
     i = 0
     while time.time() < deadline:
         i += 1
+        if i % 25 == 0 or scratch_free_bytes() < SCRATCH_LOW_FREE_BYTES:
+            reap_scratch(SCRATCH_STALE_SECONDS, f"iteration {i}")
+            free = scratch_free_bytes()
+            if free < SCRATCH_ABORT_FREE_BYTES:
+                log(f"ABORTING: only {free / (1 << 30):.1f} GiB free after cleanup -- stopping instead of reporting ENOSPC as failures")
+                break
         try:
             if mode == "edge":
                 run_one_edge_iteration()

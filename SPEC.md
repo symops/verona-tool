@@ -110,11 +110,14 @@ once, after every `-w` has been applied.
 pairs `{5,12}`, `{7,6}`, `{9,8}`. Must be combined with an explicit
 bare `-r` or `-w` to select mode (a shortcut with neither present is a
 usage error). Read mode: no value, auto-names both outputs by slot
-number. Write mode: requires `=FILE` (long-option attachment syntax
-only -- `getopt_long`-style space-separated optional arguments aren't
-supported, hence the custom parser), same file written identically
-into both slots, checked atomically against both boundaries before
-writing to either.
+number. Write mode: requires an attached FILE, written as `--kernel=FILE`
+(`--dtb=FILE`, `--rootfs=FILE`) or, equivalently, `-k=FILE` / `-k:FILE`
+(`-t`, `-f` likewise) -- `getopt_long`-style space-separated optional
+arguments aren't supported, hence the custom parser; the value is
+everything after the first `=` or `:`. Only `-k`/`-t`/`-f` take a value
+this way; every other short flag still rejects `-x=VALUE`. The same file
+is written identically into both slots, checked atomically against both
+boundaries before writing to either.
 
 `-B`/`--backup` `[FILE]` -- default
 `verona-table-backup-<platform>-<YYYYMMDDHHMMSS>.img`. Saves the

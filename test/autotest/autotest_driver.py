@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import hashlib
+import shutil
 import traceback
 import signal
 
@@ -1027,12 +1028,10 @@ def scenario_shortcut_write(platform):
         src = test_path("dupe", ".bin")
         gen_random_file(src, 64)
         before = sha256(img)
-        # Write-mode shortcuts only accept the '=FILE' attachment on the
-        # long option form (per SPEC.md); the short forms (-k/-t/-o) carry
-        # no value in write mode. Using the long form twice is still a
-        # valid way to exercise the duplicate-shortcut conflict check.
-        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w",
-                                f"{flag_long}={src}", "-w", f"{flag_long}={src}"])
+        # Any of the three FILE spellings (--name=FILE, -x=FILE, -x:FILE)
+        # is a valid way to exercise the duplicate-shortcut conflict check.
+        spell = lambda: random.choice([f"{flag_long}={src}", f"{flag_short}={src}", f"{flag_short}:{src}"])
+        rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", spell(), "-w", spell()])
         after = sha256(img)
         if rc == 5 and before == after:
             record("pass", f"shortcut_write duplicate_conflict platform={platform} name={name}")
@@ -1056,9 +1055,9 @@ def scenario_shortcut_write(platform):
     gen_random_file(src, size)
     before = sha256(img)
 
-    # Write-mode shortcuts only accept '=FILE' on the long option form.
-    flag = flag_long
-    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", f"{flag}={src}"])
+    # FILE attaches as --name=FILE, -x=FILE or -x:FILE (all equivalent).
+    arg = random.choice([f"{flag_long}={src}", f"{flag_short}={src}", f"{flag_short}:{src}"])
+    rc, out, err = verona(["-p", platform_flag(platform), "-d", img, "-w", arg])
     after = sha256(img)
 
     if mode == "oversized_half":
@@ -1920,6 +1919,69 @@ def edge_long_form_space_separated_value(platform):
     cleanup(img)
 
 
+def edge_short_shortcut_attached_value(platform):
+    """-k/-t/-f accept an attached FILE as -x=FILE and -x:FILE, exactly
+    like --kernel/--dtb/--rootfs=FILE (user request: previously only the
+    long form could carry the write-mode FILE, so "-w -t=file" was
+    rejected with a misleading "must be followed by a shortcut" error).
+    Writes the same payload into identical copies of one image using the
+    three spellings and requires byte-identical results; then checks the
+    guard rails still hold (a bare -x=FILE without its own -w/-r, one -w
+    covering two shortcuts, and every other short flag still rejecting
+    -x=VALUE)."""
+    img = fresh(platform)
+    name = random.choice(list(SHORTCUT_SLOTS))
+    flag_long = f"--{name}"
+    flag_short = {"kernel": "-k", "dtb": "-t", "rootfs": "-f"}[name]
+    slots = SHORTCUT_SLOTS[name]
+    other_short = random.choice([x for x in ("-k", "-t", "-f") if x != flag_short])
+    ok = True
+
+    b0 = duo_boundary(img, slots[0]) if platform == "duo" else monarch_boundary(img, slots[0])
+    b1 = duo_boundary(img, slots[1]) if platform == "duo" else monarch_boundary(img, slots[1])
+    min_b = min(b0, b1)
+    if min_b >= 16 and min_b <= MAX_PRACTICAL_BOUNDARY:
+        src = test_path("sshort", ".bin")
+        gen_random_file(src, random.randint(1, min(min_b, 1 << 16)))
+        results = {}
+        for label, arg in (("long", f"{flag_long}={src}"),
+                           ("short_eq", f"{flag_short}={src}"),
+                           ("short_colon", f"{flag_short}:{src}")):
+            copy = test_path("sshortimg", ".img")
+            shutil.copyfile(img, copy)
+            rc, out, err = verona(["-p", platform_flag(platform), "-d", copy, "-w", arg])
+            if rc != 0:
+                record("genuine_failure", f"edge_short_shortcut_attached_value[{label}] platform={platform} name={name} rc={rc} err={err!r}")
+                ok = False
+            results[label] = sha256(copy)
+            for slot in slots:
+                if not verify_payload(copy, platform, slot, src, f"edge_short_shortcut_attached_value[{label}] platform={platform} slot={slot}"):
+                    ok = False
+            cleanup(copy)
+        if len(set(results.values())) != 1:
+            record("genuine_failure", f"edge_short_shortcut_attached_value platform={platform} name={name}: spellings produced different images {results}")
+            ok = False
+        cleanup(src)
+
+    base = ["-p", platform_flag(platform), "-d", img]
+    for label, extra in (
+        ("bare_short_eq_no_flag", [f"{flag_short}=x"]),
+        ("bare_short_colon_no_flag", [f"{flag_short}:x"]),
+        ("one_w_two_shortcuts", ["-w", f"{flag_short}=x", f"{other_short}=y"]),
+        ("valued_w_not_bare", ["-w", "5:x", f"{flag_short}=x"]),
+        ("other_short_flag_eq", ["-p=duo"]),
+        ("other_short_flag_colon", ["-d:/dev/null"]),
+    ):
+        rc, out, err = verona(base + extra) if label not in ("other_short_flag_eq", "other_short_flag_colon") else verona(extra)
+        if rc != 1:
+            record("genuine_failure", f"edge_short_shortcut_attached_value[{label}] platform={platform} rc={rc} (expected 1) err={err!r}")
+            ok = False
+
+    if ok:
+        record("pass", f"edge_short_shortcut_attached_value platform={platform} name={name}")
+    cleanup(img)
+
+
 def edge_bare_flag_without_shortcut(platform):
     """Real bug found by the user, fixed in two rounds:
 
@@ -2598,6 +2660,7 @@ EDGE_SCENARIOS_PLATFORMED = [
     edge_flag_empty_or_missing_values, edge_repeated_nonrepeatable_flags,
     edge_missing_required_params, edge_bare_flag_without_shortcut,
     edge_long_form_space_separated_value, edge_shortcut_requires_own_bare_flag,
+    edge_short_shortcut_attached_value,
     edge_exact_boundary_write, edge_cross_device_lock_independence,
     edge_readonly_device, edge_backup_bitflip_corruption,
 ]

@@ -44,10 +44,12 @@ Shortcuts for common slot pairs (active + rescue copy)
   Must be combined with an explicit bare -r or -w in the same
   invocation to select read or write mode. In read mode they take
   no value (two files, named after their own slot numbers, are
-  produced automatically). In write mode they require '=FILE' (the
-  same FILE is written into both slots of the pair, and only if it
-  fits within both their boundaries -- otherwise neither slot is
-  touched).
+  produced automatically). In write mode they require an attached
+  FILE: --kernel=FILE, or the short spellings -k=FILE / -k:FILE (same
+  for -t, -f). The same FILE is written into both slots of the pair,
+  and only if it fits within both their boundaries -- otherwise
+  neither slot is touched. Example:
+    verona-tool -p duo -d /dev/mmcblk0 -w -k=emmc.uImage -w -t:rescue.dtb
 
 Backup (-B, --backup [FILE])
   Save the whole table to FILE before doing anything else in this

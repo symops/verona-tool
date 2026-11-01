@@ -51,7 +51,7 @@ The output is `verona-tool-arm64` in the repository root.
 make verify-deps
 ```
 
-Rebuilds, then checks the binary's `NEEDED` entries (`readelf -d`) against the exact library set the target runtime ships (`ALLOWED_LIBS` in the `Makefile`). In practice the binary needs only `libc.so.6`, plus `ld-linux-aarch64.so.1` as its ELF interpreter. If a code change ever pulls in another shared library, this target fails: fix the dependency, or update `ALLOWED_LIBS` only if the target's own library set has genuinely changed. Do not ignore the failure.
+Rebuilds, then checks the binary's `NEEDED` entries (`readelf -d`) against the exact library set the target runtime ships (`ALLOWED_LIBS` in the `Makefile`). In practice the binary needs only `libc.so.6`, plus `ld-linux-aarch64.so.1` as its ELF interpreter. The released binary uses glibc symbols up to `GLIBC_2.34`, so it runs on Debian 12 and newer (checked against Debian 12 arm64's glibc 2.36); Debian 11 (glibc 2.31) is too old. If a code change ever pulls in another shared library, this target fails: fix the dependency, or update `ALLOWED_LIBS` only if the target's own library set has genuinely changed. Do not ignore the failure.
 
 ## 5. Strip
 

@@ -16,8 +16,10 @@ implementation follows. Run `verona-tool -h` for the CLI reference.
 Ready-made binaries are attached to the
 [releases](https://github.com/symops/verona-tool/releases): the file
 `verona-tool` is a stripped **linux/arm64** executable, dynamically
-linked against glibc only (`libc.so.6`). Copy it to the unit
-(rescue/recovery environment or a full Debian) and `chmod +x` it. The
+linked against glibc only (`libc.so.6`), and it needs **glibc 2.34 or
+newer**: Debian 12 ("bookworm") and newer work, Debian 11 is too old. Copy
+it to the unit (rescue/recovery environment or a full Debian) and
+`chmod +x` it. The
 SHA-256 of each binary is in its release notes.
 
 ## Quick start
